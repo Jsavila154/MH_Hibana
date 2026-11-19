@@ -3,12 +3,13 @@
 #include "mhf/psp/runtime.hpp"
 #include "mods/mod.hpp"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 
 namespace mhf::mhfu {
 
-// Makes all 13 Training School Piercings (Head armor IDs 240..249, 309, 310, 433) craftable at the Smithy.
+// Makes the 10 Training School Piercings (Head armor IDs 240..249) craftable at the Smithy for 30,000z each.
 class CraftablePiercingsMod final : public core::mods::IMod {
 public:
     explicit CraftablePiercingsMod(psp::Runtime &runtime);
@@ -25,10 +26,13 @@ public:
 
 private:
     void ensure_guest_table();
+    void apply_prices(bool enable);
 
     psp::Runtime &runtime_;
     core::mods::ModInfo info_;
     std::atomic<bool> enabled_{false};
+    std::array<std::uint32_t, 10> original_prices_{};
+    bool saved_prices_{false};
 };
 
 } // namespace mhf::mhfu
