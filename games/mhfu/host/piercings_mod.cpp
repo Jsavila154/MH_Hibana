@@ -12,9 +12,12 @@ namespace {
 
 namespace region = mhf::psp::generated::mhfu_region_data;
 
-constexpr std::uint32_t kGuestRecipeBuffer = 0x08802000u; // unused low guest RAM below text_base (0x08804000)
-constexpr std::uint32_t kBaseRecipeIndex = 2156u;         // immediately after the 2156 vanilla armor forge entries
+constexpr std::uint32_t kGuestRecipeBuffer = 0x08802000u;  // unused low guest RAM below text_base (0x08804000)
+constexpr std::uint32_t kBaseRecipeIndex = 2156u;          // immediately after the 2156 vanilla armor forge entries
 constexpr std::uint32_t kRecipeStride = 26u;
+constexpr std::uint32_t kHeadArmorPriceTable = 0x0896325Cu; // u32 price*2 at +0x04 of each 40-byte Head armor entry (ULES01213)
+constexpr std::uint32_t kHeadArmorStride = 40u;
+constexpr std::uint32_t kPiercingRawPrice = 60000u;         // >> 1 == 30,000z craft cost
 
 struct MaterialSlot {
     std::uint16_t item_id;
@@ -26,21 +29,22 @@ struct PiercingRecipe {
     std::array<MaterialSlot, 4> mats;
 };
 
-// All 13 Training School Piercings missing from the vanilla Smithy armor forge table (ULES01213).
-constexpr std::array<PiercingRecipe, 13> kPiercingRecipes{{
-    {240, {{{206, 3}, {580, 2}, {903, 1}, {0, 0}}}}, // Silence Piercing (Carbalite Ore, KhezuHide-Cream, Commendation)
-    {241, {{{206, 3}, {594, 2}, {903, 1}, {0, 0}}}}, // Piercing of Rage (Carbalite Ore, Tigrex Scale+, Commendation)
-    {242, {{{208, 3}, {216, 2}, {904, 1}, {0, 0}}}}, // Demon Edge Piercing (Union Ore, Novacrystal, Commendation G)
-    {243, {{{205, 3}, {210, 2}, {907, 1}, {0, 0}}}}, // Blast Piercing (Dragonite Ore, Firestone, Pokke Ticket)
-    {244, {{{206, 3}, {614, 1}, {903, 1}, {0, 0}}}}, // Piercing of Mastery (Carbalite Ore, Nargacuga Tail, Commendation)
-    {245, {{{205, 3}, {215, 2}, {907, 1}, {0, 0}}}}, // Piercing of Pursuit (Dragonite Ore, Lightcrystal, Pokke Ticket)
-    {246, {{{206, 3}, {682, 2}, {903, 1}, {0, 0}}}}, // Kirin Piercing (Carbalite Ore, Kirin Horn, Commendation)
-    {247, {{{206, 3}, {555, 2}, {903, 1}, {0, 0}}}}, // Piercing of Might (Carbalite Ore, Rathalos Carpace, Commendation)
-    {248, {{{206, 3}, {536, 2}, {903, 1}, {0, 0}}}}, // Piercing of Fate (Carbalite Ore, Pnk Rathian Cpc, Commendation)
-    {249, {{{205, 3}, {284, 3}, {907, 1}, {0, 0}}}}, // Echo Piercing (Dragonite Ore, Monster Bone+, Pokke Ticket)
-    {309, {{{208, 4}, {300, 2}, {905, 2}, {0, 0}}}}, // Sword Saint Piercing (Union Ore, Wyvern Stone, Commendation S)
-    {310, {{{208, 4}, {300, 2}, {905, 2}, {0, 0}}}}, // Barrage Piercing (Union Ore, Wyvern Stone, Commendation S)
-    {433, {{{208, 5}, {301, 2}, {904, 2}, {0, 0}}}}, // Ambitious Piercing (Union Ore, Big Wyvern Stone, Commendation G)
+// 10 Training School Piercings (Sword Saint 309, Barrage 310, and Ambitious 433 remain vanilla quest rewards).
+// Tiered by rank: Low Rank (rare drops), High Rank (gems/rubies), G-Rank (Heavenly Scales). All cost 30,000z.
+constexpr std::array<PiercingRecipe, 10> kPiercingRecipes{{
+    // Low Rank (rare materials from tough LR monsters)
+    {245, {{{608, 1}, {551, 1}, {215, 3}, {0, 0}}}}, // Piercing of Pursuit (Tigrex Skull Shl, Rathalos Plate, Lightcrystal)
+    {248, {{{523, 1}, {675, 1}, {215, 3}, {0, 0}}}}, // Piercing of Fate    (Rathian Plate, Monoblos Heart, Lightcrystal)
+    {249, {{{546, 2}, {608, 1}, {682, 2}, {0, 0}}}}, // Echo Piercing       (FireWyvrn Marrow, Tigrex Skull Shl, Kirin Horn)
+    // High Rank (gems/rubies, no final-boss Akantor)
+    {241, {{{552, 1}, {300, 2}, {603, 2}, {0, 0}}}}, // Piercing of Rage    (Rathalos Ruby, Wyvern Stone, Tigrex Claw+)
+    {243, {{{524, 1}, {211, 2}, {628, 1}, {0, 0}}}}, // Blast Piercing      (Rathian Ruby, Firecell Stone, Gravios BrainStm)
+    {244, {{{622, 1}, {300, 2}, {614, 2}, {0, 0}}}}, // Piercing of Mastery (Narga Brain Stem, Wyvern Stone, Nargacuga Tail)
+    // G-Rank (Heavenly Scales, no final-boss Ukanlos/Fatalis)
+    {240, {{{525, 1}, {583, 2}, {301, 1}, {0, 0}}}}, // Silence Piercing    (HvnlyRathianScl, KhezuSpecialCut, Big Wyvern Stone)
+    {242, {{{611, 1}, {596, 1}, {301, 1}, {0, 0}}}}, // Demon Edge Piercing (HvnlyNargaScale, HvnlyTigrexScale, Big Wyvern Stone)
+    {246, {{{611, 1}, {690, 2}, {685, 2}, {0, 0}}}}, // Kirin Piercing      (HvnlyNargaScale, Kirin Azure Horn, SpecialKirinHide)
+    {247, {{{553, 1}, {596, 1}, {301, 1}, {0, 0}}}}, // Piercing of Might   (HvnlyRathalosScl, HvnlyTigrexScale, Big Wyvern Stone)
 }};
 
 constexpr bool kPiercingsSupported =
@@ -73,7 +77,7 @@ CraftablePiercingsMod::CraftablePiercingsMod(psp::Runtime &runtime)
     : runtime_(runtime),
       info_{"craftable_piercings",
             "Craftable Training Piercings",
-            "Makes all 13 Training School Piercings craftable at the Smithy using regular quest materials.",
+            "Makes the 10 Training School Piercings craftable at the Smithy (30,000z, tiered LR/HR/G rare materials).",
             core::mods::ModCategory::Gameplay,
             false,
             true,
@@ -103,7 +107,23 @@ bool CraftablePiercingsMod::set_enabled(bool enabled) {
     if (enabled == enabled_.load()) return true;
     enabled_ = enabled;
     if (enabled) ensure_guest_table();
+    apply_prices(enabled);
     return true;
+}
+
+void CraftablePiercingsMod::apply_prices(bool enable) {
+    auto &mem = runtime_.memory();
+    if (!saved_prices_) {
+        for (std::size_t k = 0; k < kPiercingRecipes.size(); ++k) {
+            const std::uint32_t addr = kHeadArmorPriceTable + static_cast<std::uint32_t>(kPiercingRecipes[k].equip_id) * kHeadArmorStride;
+            if (mem.contains(addr, 4u)) original_prices_[k] = mem.load32(addr);
+        }
+        saved_prices_ = true;
+    }
+    for (std::size_t k = 0; k < kPiercingRecipes.size(); ++k) {
+        const std::uint32_t addr = kHeadArmorPriceTable + static_cast<std::uint32_t>(kPiercingRecipes[k].equip_id) * kHeadArmorStride;
+        if (mem.contains(addr, 4u)) mem.store32(addr, enable ? kPiercingRawPrice : original_prices_[k]);
+    }
 }
 
 void CraftablePiercingsMod::ensure_guest_table() {
@@ -142,6 +162,7 @@ void CraftablePiercingsMod::on_smithy_create_list_populate_end(psp::Runtime &rt,
     const std::uint32_t game_sys = mem.load32(*region::mh_game_sys);
     if (game_sys == 0u) return;
     ensure_guest_table();
+    apply_prices(true);
 
     for (std::size_t k = 0; k < kPiercingRecipes.size(); ++k) {
         const std::uint16_t equip_id = kPiercingRecipes[k].equip_id;
