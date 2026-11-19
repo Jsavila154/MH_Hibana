@@ -13,6 +13,7 @@
 #include <cstring>
 #include <cstdint>
 #include <functional>
+#include <unordered_map>
 #include <vector>
 
 namespace mhf::psp::gpu {
@@ -87,6 +88,7 @@ public:
     [[nodiscard]] std::uint32_t clut_max_bytes() const noexcept { return clut_max_bytes_; }
     // Incremented whenever the palette is reloaded.
     [[nodiscard]] std::uint64_t clut_generation() const noexcept { return clut_generation_; }
+    [[nodiscard]] std::uint64_t clut_hash() const noexcept { return clut_hash_; }
     // The colour (ABGR8888) entry `index` of the palette gives, as the current CLUT format reads it.
     [[nodiscard]] std::uint32_t clut_lookup(std::uint32_t index) const;
     // The current camera, for backends that place vertices again (frame interpolation).
@@ -104,12 +106,20 @@ private:
     void load_clut(std::uint32_t data);
 
     // Vertex pipeline.
+    struct VertexLayout {
+        unsigned weight_offset{}, tc_offset{}, color_offset{}, normal_offset{}, pos_offset{}, size{};
+        unsigned weight_step{}, tc_step{}, normal_step{}, pos_step{};
+    };
     struct DecodedVertex {
         float pos[3]{}, uv[2]{}, color[4]{255, 255, 255, 255}, normal[3]{}, weights[8]{};
         bool has_color{};
         bool has_normal{};
     };
+    [[nodiscard]] static VertexLayout layout_for_type(std::uint32_t vt) noexcept;
+    [[nodiscard]] DecodedVertex decode_vertex(std::uint32_t address, const VertexLayout &l) const;
     [[nodiscard]] DecodedVertex decode_vertex(std::uint32_t address) const;
+    void decode_hw_vertex(std::uint32_t address, const VertexLayout &l, HwVertex &out) const;
+    void fill_hardware_state(HardwareDrawState &out, bool has_color_attr) const;
     [[nodiscard]] std::uint32_t vertex_size() const;
     [[nodiscard]] Vertex transform(const DecodedVertex &in) const;
     void light(const float world_pos[3], const float world_normal[3], Vertex &out, const DecodedVertex &in) const;
@@ -151,6 +161,7 @@ private:
 
     Backend *backend_{};
     std::uint64_t clut_generation_{};
+    std::uint64_t clut_hash_{};
     std::uint32_t clut_last_bytes_{}, clut_max_bytes_{};
     std::uint64_t camera_generation_{};
 
@@ -205,6 +216,22 @@ private:
     std::vector<std::uint32_t> call_stack_;
     std::array<std::uint32_t, 256> clut_{};
     std::vector<Vertex> verts_; // draw_primitive's vertices, kept between draws so that a draw allocates nothing
+    std::vector<Vertex> screen_verts_;
+    std::vector<std::uint8_t> screen_flags_;
+    std::vector<std::uint32_t> draw_indices_;
+    std::vector<std::int32_t> index_remap_;
+    std::vector<HwVertex> hw_verts_;
+    std::vector<std::uint32_t> hw_indices_;
+    struct CachedHwMesh {
+        std::uint64_t hash{};
+        std::uint64_t last_use{};
+        std::vector<HwVertex> verts;
+    };
+    std::unordered_map<std::uint64_t, CachedHwMesh> hw_mesh_cache_;
+    std::uint64_t hw_mesh_tick_{};
+    mutable bool hw_state_dirty_{true};
+    mutable std::uint64_t hw_state_serial_{0};
+    mutable HardwareDrawState hw_state_{};
     Stats stats_;
 };
 

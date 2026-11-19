@@ -34,9 +34,31 @@ struct DrawInfo {
     std::array<float, 8> viewport{}; // x, y, z scale; x, y, z centre; the screen offset x, y
 };
 
+struct HwVertex {
+    float pos[3]{};
+    float uv[2]{};
+    std::uint32_t color{0xFFFFFFFFu};
+    std::int16_t normal[4]{};
+    std::uint16_t weights[8]{};
+};
+
+// Packed uniform payload (72 vec4 = 288 floats) uploaded in a single glUniform4fv call.
+struct HardwareDrawState {
+    static constexpr std::size_t kVec4Count = 72;
+    std::uint64_t serial{};
+    std::array<float, kVec4Count * 4> data{};
+};
+
 class Backend {
 public:
     virtual ~Backend() = default;
+
+    [[nodiscard]] virtual bool supports_hardware_transform() const noexcept { return false; }
+    virtual void draw_hardware(const Ge &ge, const DrawInfo &draw, const HardwareDrawState &state,
+                               const HwVertex *vertices, std::uint32_t vertex_count,
+                               const std::uint32_t *indices, std::uint32_t index_count) {
+        (void)ge; (void)draw; (void)state; (void)vertices; (void)vertex_count; (void)indices; (void)index_count;
+    }
 
     // Screen-space vertices: x, y in framebuffer pixels, z in 0..65535, w = 1/w for perspective correction (1 in
     // through mode), u, v normalized (through mode: texels), colors 0..255, fog 0..1.

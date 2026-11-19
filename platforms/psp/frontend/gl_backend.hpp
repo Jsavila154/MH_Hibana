@@ -84,6 +84,8 @@ struct LiveSettings {
     // the frontend at every poll: 0 while off, with the software renderer or in a window no wider than 480:272.
     std::atomic<bool> widescreen{false};
     std::atomic<float> wide_aspect{0.0f};
+    // Hardware T&L (vertex skinning, lighting and transform on the GPU; off when shadows or >30 fps interpolation are active).
+    std::atomic<bool> hw_transform{true};
     // Written by the drawing thread at every flip: that flip drew the quest HUD (its clock). The hunting horn's song
     // panel is only shown over it.
     std::atomic<bool> quest_hud{false};

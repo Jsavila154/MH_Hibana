@@ -214,18 +214,19 @@ void Ge::execute(std::uint32_t word, std::uint32_t) {
     case kBezier: case kSpline: draw_bezier_or_spline(cmd, data); return;
     case kBoundingBox: return;
     case kWorldMatrixNumber: world_i_ = data & 15u; return;
-    case kWorldMatrixData: if (world_i_ < 12) world_.m[world_i_++] = float24(data); return;
+    case kWorldMatrixData: if (world_i_ < 12) world_.m[world_i_++] = float24(data); hw_state_dirty_ = true; return;
     case kViewMatrixNumber: view_i_ = data & 15u; return;
-    case kViewMatrixData: if (view_i_ < 12) view_.m[view_i_++] = float24(data); ++camera_generation_; return;
+    case kViewMatrixData: if (view_i_ < 12) view_.m[view_i_++] = float24(data); ++camera_generation_; hw_state_dirty_ = true; return;
     case kProjMatrixNumber: proj_i_ = data & 15u; return;
-    case kProjMatrixData: if (proj_i_ < 16) proj_.m[proj_i_++] = float24(data); ++camera_generation_; return;
+    case kProjMatrixData: if (proj_i_ < 16) proj_.m[proj_i_++] = float24(data); ++camera_generation_; hw_state_dirty_ = true; return;
     case kTgenMatrixNumber: texgen_i_ = data & 15u; return;
-    case kTgenMatrixData: if (texgen_i_ < 12) texgen_.m[texgen_i_++] = float24(data); return;
+    case kTgenMatrixData: if (texgen_i_ < 12) texgen_.m[texgen_i_++] = float24(data); hw_state_dirty_ = true; return;
     case kBoneMatrixNumber: bone_i_ = data & 0x7Fu; return;
     case kBoneMatrixData:
         if (bone_i_ < 96) {
             bones_[bone_i_ / 12].m[bone_i_ % 12] = float24(data);
             ++bone_i_;
+            hw_state_dirty_ = true;
         }
         return;
     case kLoadClut: load_clut(data); return;
@@ -233,6 +234,10 @@ void Ge::execute(std::uint32_t word, std::uint32_t) {
     default:
         if (cmd >= kMorphWeight0 && cmd < kMorphWeight0 + 8) morph_[cmd - kMorphWeight0] = float24(data);
         if ((cmd >= kViewportXScale && cmd <= kViewportZCenter) || cmd == kOffsetX || cmd == kOffsetY) ++camera_generation_;
+        if (cmd == kVertexType || cmd == kTexMapMode || (cmd >= kLightingEnable && cmd <= 0x9Bu) ||
+            cmd == kFog1 || cmd == kFog2) {
+            hw_state_dirty_ = true;
+        }
         regs_[cmd] = data;
         return;
     }
@@ -241,16 +246,21 @@ void Ge::execute(std::uint32_t word, std::uint32_t) {
 // ---------------------------------------------------------------- vertex decoding
 
 namespace {
-struct Layout {
-    unsigned weight_offset{}, tc_offset{}, color_offset{}, normal_offset{}, pos_offset{}, size{};
-};
-unsigned type_size(unsigned format, unsigned base) { return format == 0 ? 0 : (format == 3 ? 4u : format) * base; }
-unsigned align_of(unsigned format) { return format == 3 ? 4u : format; }
+constexpr unsigned type_size(unsigned format, unsigned base) noexcept {
+    return format == 0 ? 0 : (format == 3 ? 4u : format) * base;
+}
+constexpr unsigned align_of(unsigned format) noexcept { return format == 3 ? 4u : format; }
+} // namespace
 
-Layout layout_for(std::uint32_t vt) {
+Ge::VertexLayout Ge::layout_for_type(std::uint32_t vt) noexcept {
     const unsigned tc = vt & 3u, color = (vt >> 2u) & 7u, normal = (vt >> 5u) & 3u, pos = (vt >> 7u) & 3u;
     const unsigned weight = (vt >> 9u) & 3u, weights = ((vt >> 14u) & 7u) + 1u;
-    Layout l;
+    const unsigned pf = pos != 0 ? pos : 3u;
+    VertexLayout l;
+    l.weight_step = type_size(weight, 1);
+    l.tc_step = type_size(tc, 1);
+    l.normal_step = type_size(normal, 1);
+    l.pos_step = type_size(pf, 1);
     unsigned offset = 0, biggest = 1;
     auto place = [&](unsigned bytes, unsigned alignment) {
         offset = (offset + alignment - 1u) & ~(alignment - 1u);
@@ -259,51 +269,124 @@ Layout layout_for(std::uint32_t vt) {
         biggest = std::max(biggest, alignment);
         return at;
     };
-    if (weight != 0) l.weight_offset = place(type_size(weight, 1) * weights, align_of(weight));
-    if (tc != 0) l.tc_offset = place(type_size(tc, 1) * 2u, align_of(tc));
+    if (weight != 0) l.weight_offset = place(l.weight_step * weights, align_of(weight));
+    if (tc != 0) l.tc_offset = place(l.tc_step * 2u, align_of(tc));
     if (color != 0) {
         const unsigned bytes = color == 7 ? 4u : 2u;
         l.color_offset = place(bytes, bytes);
     }
-    if (normal != 0) l.normal_offset = place(type_size(normal, 1) * 3u, align_of(normal));
-    l.pos_offset = place(type_size(pos != 0 ? pos : 3u, 1) * 3u, align_of(pos != 0 ? pos : 3u));
+    if (normal != 0) l.normal_offset = place(l.normal_step * 3u, align_of(normal));
+    l.pos_offset = place(l.pos_step * 3u, align_of(pf));
     l.size = (offset + biggest - 1u) & ~(biggest - 1u);
     return l;
 }
-} // namespace
 
 std::uint32_t Ge::vertex_size() const {
     const std::uint32_t vt = regs_[kVertexType];
     const unsigned morphs = ((vt >> 18u) & 7u) + 1u;
-    return layout_for(vt).size * morphs;
+    return layout_for_type(vt).size * morphs;
 }
 
 Ge::DecodedVertex Ge::decode_vertex(std::uint32_t address) const {
+    return decode_vertex(address, layout_for_type(regs_[kVertexType]));
+}
+
+Ge::DecodedVertex Ge::decode_vertex(std::uint32_t address, const VertexLayout &l) const {
     const std::uint32_t vt = regs_[kVertexType];
     const bool through = (vt & (1u << 23u)) != 0;
     const unsigned tc = vt & 3u, color = (vt >> 2u) & 7u, normal = (vt >> 5u) & 3u, pos = (vt >> 7u) & 3u;
     const unsigned weight = (vt >> 9u) & 3u, weights = ((vt >> 14u) & 7u) + 1u;
     const unsigned morphs = ((vt >> 18u) & 7u) + 1u;
-    const Layout l = layout_for(vt);
+    const unsigned pf = pos != 0 ? pos : 3u;
+
+    DecodedVertex out{};
+    if (const std::uint8_t *base = host(address, l.size * morphs); base != nullptr && morphs == 1u) {
+        auto ps8 = [](const std::uint8_t *p) { return static_cast<float>(static_cast<std::int8_t>(*p)); };
+        auto pu8 = [](const std::uint8_t *p) { return static_cast<float>(*p); };
+        auto ps16 = [](const std::uint8_t *p) {
+            std::int16_t v;
+            std::memcpy(&v, p, 2);
+            return static_cast<float>(v);
+        };
+        auto pu16 = [](const std::uint8_t *p) {
+            std::uint16_t v;
+            std::memcpy(&v, p, 2);
+            return static_cast<float>(v);
+        };
+        auto pf32 = [](const std::uint8_t *p) {
+            float v;
+            std::memcpy(&v, p, 4);
+            return v;
+        };
+        if (weight != 0) {
+            const std::uint8_t *wp = base + l.weight_offset;
+            for (unsigned i = 0; i < weights && i < 8; ++i, wp += l.weight_step) {
+                out.weights[i] = weight == 1 ? pu8(wp) * (1.0f / 128.0f)
+                               : weight == 2 ? pu16(wp) * (1.0f / 32768.0f)
+                                             : pf32(wp);
+            }
+        }
+        if (tc != 0) {
+            const std::uint8_t *tp = base + l.tc_offset;
+            for (unsigned i = 0; i < 2; ++i, tp += l.tc_step) {
+                float t = tc == 1 ? pu8(tp) : tc == 2 ? pu16(tp) : pf32(tp);
+                if (!through) t = tc == 1 ? t * (1.0f / 128.0f) : tc == 2 ? t * (1.0f / 32768.0f) : t;
+                out.uv[i] = t;
+            }
+        }
+        if (color != 0) {
+            const std::uint8_t *cp = base + l.color_offset;
+            if (color == 7) {
+                std::uint32_t raw;
+                std::memcpy(&raw, cp, 4);
+                unpack(raw, out.color);
+            } else {
+                std::uint16_t raw;
+                std::memcpy(&raw, cp, 2);
+                unpack(decode16(raw, color - 4u), out.color);
+            }
+            out.has_color = true;
+        }
+        if (normal != 0) {
+            const std::uint8_t *np = base + l.normal_offset;
+            for (unsigned i = 0; i < 3; ++i, np += l.normal_step) {
+                out.normal[i] = normal == 1 ? ps8(np) * (1.0f / 128.0f)
+                              : normal == 2 ? ps16(np) * (1.0f / 32768.0f)
+                                            : pf32(np);
+            }
+            out.has_normal = true;
+        }
+        const std::uint8_t *pp = base + l.pos_offset;
+        for (unsigned i = 0; i < 3; ++i, pp += l.pos_step) {
+            if (through) {
+                out.pos[i] = pf == 1 ? ps8(pp) : pf == 2 ? (i == 2 ? pu16(pp) : ps16(pp)) : pf32(pp);
+            } else {
+                out.pos[i] = pf == 1 ? ps8(pp) * (1.0f / 128.0f)
+                           : pf == 2 ? ps16(pp) * (1.0f / 32768.0f)
+                                     : pf32(pp);
+            }
+        }
+        return out;
+    }
+
     auto s8 = [&](std::uint32_t a) { return static_cast<float>(static_cast<std::int8_t>(rd8(a))); };
     auto u8 = [&](std::uint32_t a) { return static_cast<float>(rd8(a)); };
     auto s16 = [&](std::uint32_t a) { return static_cast<float>(static_cast<std::int16_t>(rd16(a))); };
     auto u16 = [&](std::uint32_t a) { return static_cast<float>(rd16(a)); };
     auto f32 = [&](std::uint32_t a) { return std::bit_cast<float>(rd32(a)); };
 
-    DecodedVertex out{};
     for (unsigned m = 0; m < morphs; ++m) {
         const std::uint32_t v = address + m * l.size;
         const float mw = morphs > 1 ? morph_[m] : 1.0f;
         if (weight != 0) {
             for (unsigned i = 0; i < weights && i < 8; ++i) {
-                const std::uint32_t a = v + l.weight_offset + i * type_size(weight, 1);
+                const std::uint32_t a = v + l.weight_offset + i * l.weight_step;
                 out.weights[i] += mw * (weight == 1 ? u8(a) / 128.0f : weight == 2 ? u16(a) / 32768.0f : f32(a));
             }
         }
         if (tc != 0) {
             for (unsigned i = 0; i < 2; ++i) {
-                const std::uint32_t a = v + l.tc_offset + i * type_size(tc, 1);
+                const std::uint32_t a = v + l.tc_offset + i * l.tc_step;
                 float t = tc == 1 ? u8(a) : tc == 2 ? u16(a) : f32(a);
                 if (!through) t = tc == 1 ? t / 128.0f : tc == 2 ? t / 32768.0f : t;
                 out.uv[i] += mw * t;
@@ -319,14 +402,13 @@ Ge::DecodedVertex Ge::decode_vertex(std::uint32_t address) const {
         }
         if (normal != 0) {
             for (unsigned i = 0; i < 3; ++i) {
-                const std::uint32_t a = v + l.normal_offset + i * type_size(normal, 1);
+                const std::uint32_t a = v + l.normal_offset + i * l.normal_step;
                 out.normal[i] += mw * (normal == 1 ? s8(a) / 128.0f : normal == 2 ? s16(a) / 32768.0f : f32(a));
             }
             out.has_normal = true;
         }
-        const unsigned pf = pos != 0 ? pos : 3u;
         for (unsigned i = 0; i < 3; ++i) {
-            const std::uint32_t a = v + l.pos_offset + i * type_size(pf, 1);
+            const std::uint32_t a = v + l.pos_offset + i * l.pos_step;
             float p;
             if (through) {
                 p = pf == 1 ? s8(a) : pf == 2 ? (i == 2 ? u16(a) : s16(a)) : f32(a);
@@ -579,58 +661,283 @@ void Ge::draw_primitive(std::uint32_t data) {
                          float24(regs_[kViewportXCenter]), float24(regs_[kViewportYCenter]), float24(regs_[kViewportZCenter]),
                          static_cast<float>(regs_[kOffsetX] & 0xFFFFu) / 16.0f, static_cast<float>(regs_[kOffsetY] & 0xFFFFu) / 16.0f};
         backend_->draw_started(draw);
+
+        const unsigned morphs = ((vt >> 18u) & 7u) + 1u;
+        if (!through && morphs == 1 && type >= 3u && type <= 5u && count > 0u && backend_->supports_hardware_transform()) {
+            if (hw_state_dirty_) {
+                if ((regs_[kLightingEnable] & 1u) != 0) prepare_lighting();
+                fill_hardware_state(hw_state_, ((vt >> 2u) & 7u) != 0);
+                hw_state_.serial = ++hw_state_serial_;
+                hw_state_dirty_ = false;
+            }
+            const VertexLayout hw_layout = layout_for_type(vt);
+            auto hash_bytes = [](const std::uint8_t *p, std::uint32_t bytes) -> std::uint64_t {
+                std::uint64_t h = 0xCBF29CE484222325ull;
+                std::uint32_t i = 0;
+                for (; i + 8u <= bytes; i += 8u) {
+                    std::uint64_t v;
+                    std::memcpy(&v, p + i, 8);
+                    h ^= v;
+                    h *= 0x100000001B3ull;
+                }
+                for (; i < bytes; ++i) {
+                    h ^= p[i];
+                    h *= 0x100000001B3ull;
+                }
+                return h;
+            };
+            auto cached_decode = [&](std::uint32_t base_addr, std::uint32_t vcount) -> const HwVertex * {
+                const std::uint32_t bytes = vcount * vsize;
+                const std::uint8_t *raw = host(base_addr, bytes);
+                if (raw == nullptr || vcount > 4096u) return nullptr;
+                const std::uint64_t h = hash_bytes(raw, bytes);
+                const std::uint64_t key =
+                    (static_cast<std::uint64_t>(base_addr) << 32u) ^ (static_cast<std::uint64_t>(vt) * 0x9E3779B97F4A7C15ull) ^ vcount;
+                if (hw_mesh_cache_.size() >= 512u && hw_mesh_cache_.find(key) == hw_mesh_cache_.end()) {
+                    hw_mesh_cache_.clear();
+                }
+                CachedHwMesh &entry = hw_mesh_cache_[key];
+                entry.last_use = ++hw_mesh_tick_;
+                if (entry.verts.size() != vcount || entry.hash != h) {
+                    entry.hash = h;
+                    entry.verts.resize(vcount);
+                    for (std::uint32_t v = 0; v < vcount; ++v) {
+                        decode_hw_vertex(base_addr + v * vsize, hw_layout, entry.verts[v]);
+                    }
+                }
+                return entry.verts.data();
+            };
+
+            if (index_format == 0u) {
+                const HwVertex *vptr = cached_decode(vaddr, count);
+                if (vptr == nullptr) {
+                    hw_verts_.resize(count);
+                    for (unsigned i = 0; i < count; ++i) {
+                        decode_hw_vertex(vaddr + i * vsize, hw_layout, hw_verts_[i]);
+                    }
+                    vptr = hw_verts_.data();
+                }
+                regs_[kVaddr] = vaddr + count * vsize;
+                backend_->draw_hardware(*this, draw, hw_state_, vptr, count, nullptr, 0u);
+            } else {
+                hw_indices_.resize(count);
+                std::uint32_t min_idx = 0xFFFFFFFFu, max_idx = 0u;
+                const std::uint32_t idx_bytes = count * (index_format == 1u ? 1u : index_format == 2u ? 2u : 4u);
+                if (const std::uint8_t *ip = host(iaddr, idx_bytes)) {
+                    for (unsigned i = 0; i < count; ++i) {
+                        std::uint32_t idx = 0;
+                        if (index_format == 1u) idx = ip[i];
+                        else if (index_format == 2u) {
+                            std::uint16_t v16;
+                            std::memcpy(&v16, ip + i * 2u, 2);
+                            idx = v16;
+                        } else {
+                            std::memcpy(&idx, ip + i * 4u, 4);
+                        }
+                        hw_indices_[i] = idx;
+                        if (idx < min_idx) min_idx = idx;
+                        if (idx > max_idx) max_idx = idx;
+                    }
+                } else {
+                    for (unsigned i = 0; i < count; ++i) {
+                        std::uint32_t idx = 0;
+                        if (index_format == 1u) idx = rd8(iaddr + i);
+                        else if (index_format == 2u) idx = rd16(iaddr + i * 2u);
+                        else idx = rd32(iaddr + i * 4u);
+                        hw_indices_[i] = idx;
+                        if (idx < min_idx) min_idx = idx;
+                        if (idx > max_idx) max_idx = idx;
+                    }
+                }
+                regs_[kIaddr] = iaddr + idx_bytes;
+                const std::uint32_t span = (max_idx >= min_idx) ? (max_idx - min_idx + 1u) : 0u;
+                if (span > 0u && span <= count * 2u && span <= 4096u) {
+                    const std::uint32_t base_addr = vaddr + min_idx * vsize;
+                    const HwVertex *vptr = cached_decode(base_addr, span);
+                    if (vptr == nullptr) {
+                        hw_verts_.resize(span);
+                        for (std::uint32_t v = 0; v < span; ++v) {
+                            decode_hw_vertex(base_addr + v * vsize, hw_layout, hw_verts_[v]);
+                        }
+                        vptr = hw_verts_.data();
+                    }
+                    if (min_idx != 0u) {
+                        for (unsigned i = 0; i < count; ++i) hw_indices_[i] -= min_idx;
+                    }
+                    backend_->draw_hardware(*this, draw, hw_state_, vptr, span, hw_indices_.data(), count);
+                } else {
+                    hw_verts_.resize(count);
+                    for (unsigned i = 0; i < count; ++i) {
+                        decode_hw_vertex(vaddr + hw_indices_[i] * vsize, hw_layout, hw_verts_[i]);
+                    }
+                    backend_->draw_hardware(*this, draw, hw_state_, hw_verts_.data(), count, nullptr, 0u);
+                }
+            }
+            return;
+        }
     }
     // Timing the drawing commands costs a clock read each; only when the interpolation log is on.
     static const bool timed = std::getenv("MHF_INTERP_LOG") != nullptr;
     const auto t_start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (!through && (regs_[kLightingEnable] & 1u) != 0) prepare_lighting(); // once per draw (see LightSetup)
+    const VertexLayout layout = layout_for_type(vt);
     std::vector<Vertex> &verts = verts_;
     verts.clear();
-    verts.reserve(count);
-    for (unsigned i = 0; i < count; ++i) {
-        std::uint32_t index = i;
-        if (index_format == 1) index = rd8(iaddr + i);
-        else if (index_format == 2) index = rd16(iaddr + i * 2u);
-        else if (index_format == 3) index = rd32(iaddr + i * 4u);
-        verts.push_back(transform(decode_vertex(vaddr + index * vsize)));
-        verts.back().source = vaddr + index * vsize;
+
+    bool use_indices = false;
+    if (index_format == 0) {
+        verts.reserve(count);
+        for (unsigned i = 0; i < count; ++i) {
+            const std::uint32_t src_addr = vaddr + i * vsize;
+            verts.push_back(transform(decode_vertex(src_addr, layout)));
+            verts.back().source = src_addr;
+        }
+        regs_[kVaddr] = vaddr + count * vsize;
+    } else {
+        draw_indices_.resize(count);
+        std::uint32_t min_idx = 0xFFFFFFFFu, max_idx = 0u;
+        const std::uint32_t idx_bytes = count * (index_format == 1 ? 1u : index_format == 2 ? 2u : 4u);
+        if (const std::uint8_t *ip = host(iaddr, idx_bytes)) {
+            for (unsigned i = 0; i < count; ++i) {
+                std::uint32_t idx = 0;
+                if (index_format == 1) idx = ip[i];
+                else if (index_format == 2) {
+                    std::uint16_t v16;
+                    std::memcpy(&v16, ip + i * 2u, 2);
+                    idx = v16;
+                } else {
+                    std::memcpy(&idx, ip + i * 4u, 4);
+                }
+                draw_indices_[i] = idx;
+                if (idx < min_idx) min_idx = idx;
+                if (idx > max_idx) max_idx = idx;
+            }
+        } else {
+            for (unsigned i = 0; i < count; ++i) {
+                std::uint32_t idx = i;
+                if (index_format == 1) idx = rd8(iaddr + i);
+                else if (index_format == 2) idx = rd16(iaddr + i * 2u);
+                else if (index_format == 3) idx = rd32(iaddr + i * 4u);
+                draw_indices_[i] = idx;
+                if (idx < min_idx) min_idx = idx;
+                if (idx > max_idx) max_idx = idx;
+            }
+        }
+        regs_[kIaddr] = iaddr + idx_bytes;
+        const std::uint32_t span = (max_idx >= min_idx) ? (max_idx - min_idx + 1u) : 0u;
+        if (span > 0u && span <= count && span <= 4096u) {
+            use_indices = true;
+            index_remap_.assign(span, -1);
+            verts.reserve(span);
+            for (unsigned i = 0; i < count; ++i) {
+                const std::uint32_t rel = draw_indices_[i] - min_idx;
+                std::int32_t &slot = index_remap_[rel];
+                if (slot < 0) {
+                    slot = static_cast<std::int32_t>(verts.size());
+                    const std::uint32_t src_addr = vaddr + draw_indices_[i] * vsize;
+                    verts.push_back(transform(decode_vertex(src_addr, layout)));
+                    verts.back().source = src_addr;
+                }
+                draw_indices_[i] = static_cast<std::uint32_t>(slot);
+            }
+        } else {
+            verts.reserve(count);
+            for (unsigned i = 0; i < count; ++i) {
+                const std::uint32_t src_addr = vaddr + draw_indices_[i] * vsize;
+                verts.push_back(transform(decode_vertex(src_addr, layout)));
+                verts.back().source = src_addr;
+            }
+        }
+    }
+
+    if (!through && type >= 3u && type <= 5u) {
+        const std::size_t nverts = verts.size();
+        screen_verts_.resize(nverts);
+        screen_flags_.resize(nverts);
+        const float offset_x = static_cast<float>(regs_[kOffsetX] & 0xFFFFu) / 16.0f;
+        const float offset_y = static_cast<float>(regs_[kOffsetY] & 0xFFFFu) / 16.0f;
+        const float vpxs = float24(regs_[kViewportXScale]), vpys = float24(regs_[kViewportYScale]),
+                    vpzs = float24(regs_[kViewportZScale]);
+        const float vpxc = float24(regs_[kViewportXCenter]), vpyc = float24(regs_[kViewportYCenter]),
+                    vpzc = float24(regs_[kViewportZCenter]);
+        for (std::size_t i = 0; i < nverts; ++i) {
+            const Vertex &c = verts[i];
+            if (!(c.z > -c.w && c.w > 0.0f)) {
+                screen_flags_[i] = 0u;
+                continue;
+            }
+            const float inv_w = 1.0f / c.w;
+            const float sx = c.x * inv_w * vpxs + vpxc;
+            const float sy = c.y * inv_w * vpys + vpyc;
+            if (!(sx >= 0.0f && sx < 4096.0f && sy >= 0.0f && sy < 4096.0f)) {
+                screen_flags_[i] = 1u; // inside near plane, outside guard band
+                continue;
+            }
+            Vertex &s = screen_verts_[i];
+            s = c;
+            s.x = sx - offset_x;
+            s.y = sy - offset_y;
+            s.z = c.z * inv_w * vpzs + vpzc;
+            s.w = inv_w;
+            screen_flags_[i] = 3u; // inside near plane and guard band
+        }
     }
     const auto t_vertices = timed ? std::chrono::steady_clock::now() : t_start;
-    // The vertex (or index) pointer advances past what was consumed.
-    if (index_format == 0) regs_[kVaddr] = vaddr + count * vsize;
-    else regs_[kIaddr] = iaddr + count * (index_format == 1 ? 1u : index_format == 2 ? 2u : 4u);
 
-    auto tri = [&](const Vertex &a, const Vertex &b, const Vertex &c) {
-        if (through) draw_triangle_screen(a, b, c);
-        else draw_triangle(a, b, c);
+    auto v_idx = [&](unsigned i) -> std::uint32_t { return use_indices ? draw_indices_[i] : i; };
+    auto tri_idx = [&](std::uint32_t ia, std::uint32_t ib, std::uint32_t ic) {
+        if (through) {
+            draw_triangle_screen(verts[ia], verts[ib], verts[ic]);
+            return;
+        }
+        const std::uint8_t fa = screen_flags_[ia], fb = screen_flags_[ib], fc = screen_flags_[ic];
+        if ((fa & fb & fc) == 3u) {
+            if (backend_ != nullptr) backend_->triangle_unclipped(*this, verts[ia], verts[ib], verts[ic]);
+            draw_triangle_screen(screen_verts_[ia], screen_verts_[ib], screen_verts_[ic]);
+            return;
+        }
+        if (fa == 1u || fb == 1u || fc == 1u) {
+            if (backend_ != nullptr) backend_->triangle_unclipped(*this, verts[ia], verts[ib], verts[ic]);
+            return; // outside guard band
+        }
+        draw_triangle(verts[ia], verts[ib], verts[ic]);
     };
     switch (type) {
     case 0:
-        for (const auto &v : verts) draw_point(through ? v : to_screen(v));
+        for (unsigned i = 0; i < count; ++i) {
+            const Vertex &v = verts[v_idx(i)];
+            draw_point(through ? v : to_screen(v));
+        }
         break;
     case 1:
-        for (unsigned i = 0; i + 1 < count; i += 2)
-            draw_line(through ? verts[i] : to_screen(verts[i]), through ? verts[i + 1] : to_screen(verts[i + 1]));
+        for (unsigned i = 0; i + 1 < count; i += 2) {
+            const Vertex &va = verts[v_idx(i)], &vb = verts[v_idx(i + 1)];
+            draw_line(through ? va : to_screen(va), through ? vb : to_screen(vb));
+        }
         break;
     case 2:
-        for (unsigned i = 0; i + 1 < count; ++i)
-            draw_line(through ? verts[i] : to_screen(verts[i]), through ? verts[i + 1] : to_screen(verts[i + 1]));
+        for (unsigned i = 0; i + 1 < count; ++i) {
+            const Vertex &va = verts[v_idx(i)], &vb = verts[v_idx(i + 1)];
+            draw_line(through ? va : to_screen(va), through ? vb : to_screen(vb));
+        }
         break;
     case 3:
-        for (unsigned i = 0; i + 2 < count; i += 3) tri(verts[i], verts[i + 1], verts[i + 2]);
+        for (unsigned i = 0; i + 2 < count; i += 3) tri_idx(v_idx(i), v_idx(i + 1), v_idx(i + 2));
         break;
     case 4:
         for (unsigned i = 0; i + 2 < count; ++i) {
-            if ((i & 1u) == 0) tri(verts[i], verts[i + 1], verts[i + 2]);
-            else tri(verts[i + 1], verts[i], verts[i + 2]);
+            if ((i & 1u) == 0) tri_idx(v_idx(i), v_idx(i + 1), v_idx(i + 2));
+            else tri_idx(v_idx(i + 1), v_idx(i), v_idx(i + 2));
         }
         break;
     case 5:
-        for (unsigned i = 1; i + 1 < count; ++i) tri(verts[0], verts[i], verts[i + 1]);
+        for (unsigned i = 1; i + 1 < count; ++i) tri_idx(v_idx(0), v_idx(i), v_idx(i + 1));
         break;
     case 6:
-        for (unsigned i = 0; i + 1 < count; i += 2)
-            draw_sprite(through ? verts[i] : to_screen(verts[i]), through ? verts[i + 1] : to_screen(verts[i + 1]));
+        for (unsigned i = 0; i + 1 < count; i += 2) {
+            const Vertex &va = verts[v_idx(i)], &vb = verts[v_idx(i + 1)];
+            draw_sprite(through ? va : to_screen(va), through ? vb : to_screen(vb));
+        }
         break;
     default:
         break;
@@ -1008,13 +1315,38 @@ void Ge::block_transfer(std::uint32_t data) {
 // ---------------------------------------------------------------- textures
 
 void Ge::load_clut(std::uint32_t data) {
-    ++clut_generation_;
     const std::uint32_t address = (regs_[kClutAddr] & 0xFFFFF0u) | ((regs_[kClutAddrUpper] & 0x0F0000u) << 8u);
     const std::uint32_t bytes = std::min<std::uint32_t>((data & 0x3Fu) * 32u, 1024u);
     clut_last_bytes_ = bytes;
     clut_max_bytes_ = std::max(clut_max_bytes_, bytes);
-    for (std::uint32_t i = 0; i < bytes / 4u; ++i) {
-        clut_[i] = rd32(address + i * 4u);
+    bool changed = false;
+    const std::uint32_t words = bytes / 4u;
+    if (const std::uint8_t *p = host(address, bytes)) {
+        for (std::uint32_t i = 0; i < words; ++i) {
+            std::uint32_t w;
+            std::memcpy(&w, p + i * 4u, 4);
+            if (clut_[i] != w) {
+                clut_[i] = w;
+                changed = true;
+            }
+        }
+    } else {
+        for (std::uint32_t i = 0; i < words; ++i) {
+            const std::uint32_t w = rd32(address + i * 4u);
+            if (clut_[i] != w) {
+                clut_[i] = w;
+                changed = true;
+            }
+        }
+    }
+    if (changed || clut_hash_ == 0u) {
+        ++clut_generation_;
+        std::uint64_t h = 0xCBF29CE484222325ull;
+        for (const std::uint32_t c : clut_) {
+            h ^= c;
+            h *= 0x100000001B3ull;
+        }
+        clut_hash_ = h;
     }
 }
 
@@ -1152,6 +1484,28 @@ Ge::TextureInfo Ge::texture_info() const {
 
 void Ge::decode_texture(std::uint32_t *out) const {
     const TextureInfo t = texture_info();
+    if ((t.format == 4u || t.format == 5u) && t.bytes > 0u) {
+        if (const std::uint8_t *src = host(t.address, t.bytes)) {
+            std::uint32_t pal[256];
+            const std::uint32_t pal_count = (t.format == 4u) ? 16u : 256u;
+            for (std::uint32_t i = 0; i < pal_count; ++i) pal[i] = clut_lookup(i);
+            const std::uint32_t bits = (t.format == 4u) ? 4u : 8u;
+            const std::uint32_t row_bytes = t.stride * bits / 8u;
+            const std::uint32_t blocks_per_row = std::max(1u, row_bytes / 16u);
+            for (std::uint32_t y = 0; y < t.height; ++y) {
+                std::uint32_t *dst_row = out + y * t.width;
+                for (std::uint32_t x = 0; x < t.width; ++x) {
+                    const std::uint32_t xbyte = x * bits / 8u;
+                    const std::uint32_t offset =
+                        t.swizzled ? (((y / 8u) * blocks_per_row + xbyte / 16u) * 128u + (y % 8u) * 16u + (xbyte % 16u))
+                                   : (y * row_bytes + xbyte);
+                    const std::uint8_t byte = src[offset];
+                    dst_row[x] = (t.format == 4u) ? pal[(byte >> ((x & 1u) * 4u)) & 0xFu] : pal[byte];
+                }
+            }
+            return;
+        }
+    }
     for (std::uint32_t y = 0; y < t.height; ++y) {
         for (std::uint32_t x = 0; x < t.width; ++x) {
             out[y * t.width + x] = fetch_texel(0, static_cast<int>(x), static_cast<int>(y));
@@ -1184,6 +1538,224 @@ std::uint64_t Ge::texture_hash() const {
         for (const std::uint32_t c : clut_) mix(c);
     }
     return h;
+}
+
+void Ge::decode_hw_vertex(std::uint32_t address, const VertexLayout &l, HwVertex &out) const {
+    const std::uint32_t vt = regs_[kVertexType];
+    const unsigned tc = vt & 3u, color = (vt >> 2u) & 7u, normal = (vt >> 5u) & 3u, pos = (vt >> 7u) & 3u;
+    const unsigned weight = (vt >> 9u) & 3u, weights = ((vt >> 14u) & 7u) + 1u;
+    const unsigned pf = pos != 0u ? pos : 3u;
+
+    auto to_u16_w = [](float w) -> std::uint16_t {
+        const float scaled = w * 32768.0f;
+        return scaled <= 0.0f ? 0u : (scaled >= 65535.0f ? 65535u : static_cast<std::uint16_t>(scaled + 0.5f));
+    };
+    auto to_s16_n = [](float n) -> std::int16_t {
+        const float scaled = n * 32767.0f;
+        return scaled <= -32767.0f ? -32767 : (scaled >= 32767.0f ? 32767 : static_cast<std::int16_t>(scaled));
+    };
+
+    if (const std::uint8_t *base = host(address, l.size)) {
+        auto ps8 = [](const std::uint8_t *p) { return static_cast<float>(static_cast<std::int8_t>(*p)); };
+        auto pu8 = [](const std::uint8_t *p) { return static_cast<float>(*p); };
+        auto ps16 = [](const std::uint8_t *p) {
+            std::int16_t v;
+            std::memcpy(&v, p, 2);
+            return static_cast<float>(v);
+        };
+        auto pu16 = [](const std::uint8_t *p) {
+            std::uint16_t v;
+            std::memcpy(&v, p, 2);
+            return static_cast<float>(v);
+        };
+        auto pf32 = [](const std::uint8_t *p) {
+            float v;
+            std::memcpy(&v, p, 4);
+            return v;
+        };
+        if (weight != 0u) {
+            const std::uint8_t *wp = base + l.weight_offset;
+            unsigned i = 0;
+            for (; i < weights && i < 8u; ++i, wp += l.weight_step) {
+                if (weight == 1u) out.weights[i] = static_cast<std::uint16_t>(wp[0]) << 8u;
+                else if (weight == 2u) std::memcpy(&out.weights[i], wp, 2);
+                else out.weights[i] = to_u16_w(pf32(wp));
+            }
+            for (; i < 8u; ++i) out.weights[i] = 0u;
+        }
+        if (tc != 0u) {
+            const std::uint8_t *tp = base + l.tc_offset;
+            for (unsigned i = 0; i < 2u; ++i, tp += l.tc_step) {
+                const float t = (tc == 1u) ? pu8(tp) : (tc == 2u) ? pu16(tp) : pf32(tp);
+                out.uv[i] = (tc == 1u) ? (t * (1.0f / 128.0f)) : (tc == 2u) ? (t * (1.0f / 32768.0f)) : t;
+            }
+        } else {
+            out.uv[0] = out.uv[1] = 0.0f;
+        }
+        if (color != 0u) {
+            const std::uint8_t *cp = base + l.color_offset;
+            if (color == 7u) {
+                std::memcpy(&out.color, cp, 4);
+            } else {
+                std::uint16_t raw;
+                std::memcpy(&raw, cp, 2);
+                out.color = decode16(raw, color - 4u);
+            }
+        } else {
+            out.color = 0xFFFFFFFFu;
+        }
+        if (normal != 0u) {
+            const std::uint8_t *np = base + l.normal_offset;
+            for (unsigned i = 0; i < 3u; ++i, np += l.normal_step) {
+                if (normal == 1u) out.normal[i] = static_cast<std::int16_t>(static_cast<std::int8_t>(*np)) << 8;
+                else if (normal == 2u) std::memcpy(&out.normal[i], np, 2);
+                else out.normal[i] = to_s16_n(pf32(np));
+            }
+        } else {
+            out.normal[0] = out.normal[1] = out.normal[2] = 0;
+        }
+        const std::uint8_t *pp = base + l.pos_offset;
+        for (unsigned i = 0; i < 3u; ++i, pp += l.pos_step) {
+            out.pos[i] = (pf == 1u) ? (ps8(pp) * (1.0f / 128.0f))
+                       : (pf == 2u) ? (ps16(pp) * (1.0f / 32768.0f))
+                                    : pf32(pp);
+        }
+        return;
+    }
+
+    out = HwVertex{};
+    auto s8 = [&](std::uint32_t a) { return static_cast<float>(static_cast<std::int8_t>(rd8(a))); };
+    auto u8 = [&](std::uint32_t a) { return static_cast<float>(rd8(a)); };
+    auto s16 = [&](std::uint32_t a) { return static_cast<float>(static_cast<std::int16_t>(rd16(a))); };
+    auto u16 = [&](std::uint32_t a) { return static_cast<float>(rd16(a)); };
+    auto f32 = [&](std::uint32_t a) { return std::bit_cast<float>(rd32(a)); };
+    if (weight != 0u) {
+        for (unsigned i = 0; i < weights && i < 8u; ++i) {
+            const std::uint32_t a = address + l.weight_offset + i * l.weight_step;
+            out.weights[i] = (weight == 1u) ? static_cast<std::uint16_t>(rd8(a) << 8u)
+                           : (weight == 2u) ? rd16(a)
+                                            : to_u16_w(f32(a));
+        }
+    }
+    if (tc != 0u) {
+        for (unsigned i = 0; i < 2u; ++i) {
+            const std::uint32_t a = address + l.tc_offset + i * l.tc_step;
+            const float t = (tc == 1u) ? u8(a) : (tc == 2u) ? u16(a) : f32(a);
+            out.uv[i] = (tc == 1u) ? (t / 128.0f) : (tc == 2u) ? (t / 32768.0f) : t;
+        }
+    }
+    if (color != 0u) {
+        const std::uint32_t a = address + l.color_offset;
+        out.color = (color == 7u) ? rd32(a) : decode16(rd16(a), color - 4u);
+    }
+    if (normal != 0u) {
+        for (unsigned i = 0; i < 3u; ++i) {
+            const std::uint32_t a = address + l.normal_offset + i * l.normal_step;
+            out.normal[i] = (normal == 1u) ? static_cast<std::int16_t>(static_cast<std::int8_t>(rd8(a)) << 8)
+                          : (normal == 2u) ? static_cast<std::int16_t>(rd16(a))
+                                           : to_s16_n(f32(a));
+        }
+    }
+    for (unsigned i = 0; i < 3u; ++i) {
+        const std::uint32_t a = address + l.pos_offset + i * l.pos_step;
+        out.pos[i] = (pf == 1u) ? (s8(a) / 128.0f) : (pf == 2u) ? (s16(a) / 32768.0f) : f32(a);
+    }
+}
+
+void Ge::fill_hardware_state(HardwareDrawState &out, bool has_color_attr) const {
+    auto &d = out.data;
+    auto put_mat43 = [&](std::size_t vec4_idx, const Matrix43 &m) {
+        const std::size_t base = vec4_idx * 4u;
+        // Pack 4x3 column-major matrix into 3 vec4s:
+        // vec0 = (m[0], m[3], m[6], m[9])  (row 0)
+        // vec1 = (m[1], m[4], m[7], m[10]) (row 1)
+        // vec2 = (m[2], m[5], m[8], m[11]) (row 2)
+        d[base + 0] = m.m[0]; d[base + 1] = m.m[3]; d[base + 2]  = m.m[6]; d[base + 3]  = m.m[9];
+        d[base + 4] = m.m[1]; d[base + 5] = m.m[4]; d[base + 6]  = m.m[7]; d[base + 7]  = m.m[10];
+        d[base + 8] = m.m[2]; d[base + 9] = m.m[5]; d[base + 10] = m.m[8]; d[base + 11] = m.m[11];
+    };
+
+    const std::uint32_t vt = regs_[kVertexType];
+    const unsigned skin_count = (((vt >> 9u) & 3u) != 0u) ? (((vt >> 14u) & 7u) + 1u) : 0u;
+    for (std::size_t b = 0; b < skin_count && b < 8u; ++b) {
+        put_mat43(b * 3u, bones_[b]);
+    }
+    put_mat43(24u, world_);
+    put_mat43(27u, view_);
+    std::copy(proj_.m.begin(), proj_.m.end(), d.begin() + 30u * 4u); // 30..33
+    const std::uint32_t tex_mode = regs_[kTexMapMode] & 3u;
+    if (tex_mode == 1u) put_mat43(34u, texgen_);
+
+    // 37: tex_xform
+    d[37 * 4 + 0] = float24(regs_[kTexScaleU]);
+    d[37 * 4 + 1] = float24(regs_[kTexScaleV]);
+    d[37 * 4 + 2] = float24(regs_[kTexOffsetU]);
+    d[37 * 4 + 3] = float24(regs_[kTexOffsetV]);
+
+    // 38: fog & texgen mode
+    d[38 * 4 + 0] = float24(regs_[kFog1]);
+    d[38 * 4 + 1] = float24(regs_[kFog2]);
+    d[38 * 4 + 2] = static_cast<float>(regs_[kFogEnable] & 1u);
+    d[38 * 4 + 3] = static_cast<float>(tex_mode | (((regs_[kTexMapMode] >> 8u) & 3u) << 2u));
+
+    // 39..43: lighting materials & global ambient
+    const bool lighting_on = (regs_[kLightingEnable] & 1u) != 0u;
+    const LightSetup &ls = light_setup_;
+    d[39 * 4 + 0] = ls.emissive[0]; d[39 * 4 + 1] = ls.emissive[1]; d[39 * 4 + 2] = ls.emissive[2];
+    d[39 * 4 + 3] = lighting_on ? 1.0f : 0.0f;
+
+    float amb[4]{};
+    unpack(regs_[kMaterialAmbient] | (regs_[kMaterialAlpha] << 24u), amb);
+    d[40 * 4 + 0] = amb[0]; d[40 * 4 + 1] = amb[1]; d[40 * 4 + 2] = amb[2]; d[40 * 4 + 3] = amb[3];
+
+    if (lighting_on) {
+        d[41 * 4 + 0] = ls.diffuse[0]; d[41 * 4 + 1] = ls.diffuse[1]; d[41 * 4 + 2] = ls.diffuse[2];
+        d[41 * 4 + 3] = ls.shininess;
+
+        d[42 * 4 + 0] = ls.specular[0]; d[42 * 4 + 1] = ls.specular[1]; d[42 * 4 + 2] = ls.specular[2];
+        d[42 * 4 + 3] = static_cast<float>(has_color_attr ? ls.update : 0u);
+
+        d[43 * 4 + 0] = ls.global[0]; d[43 * 4 + 1] = ls.global[1]; d[43 * 4 + 2] = ls.global[2]; d[43 * 4 + 3] = ls.global[3];
+    }
+
+    // 44: flags (skin_count, reverse_normal, separate_specular, has_color_attr)
+    d[44 * 4 + 0] = static_cast<float>(skin_count);
+    d[44 * 4 + 1] = static_cast<float>(ls.reverse_normal ? 1 : 0);
+    d[44 * 4 + 2] = static_cast<float>(ls.separate ? 1 : 0);
+    d[44 * 4 + 3] = static_cast<float>(has_color_attr ? 1 : 0);
+
+    // 45..68: 4 lights (6 vec4 each)
+    if (lighting_on) {
+        for (std::size_t i = 0; i < 4u; ++i) {
+            const auto &l = ls.lights[i];
+            const std::size_t lb = (45u + i * 6u) * 4u;
+            d[lb + 3] = l.on ? static_cast<float>(1u + l.kind) : 0.0f; // 0=off, 1=dir, 2=point, 3=spot
+            if (!l.on) continue;
+            d[lb + 0] = l.lp[0]; d[lb + 1] = l.lp[1]; d[lb + 2] = l.lp[2];
+            d[lb + 4] = l.ld[0]; d[lb + 5] = l.ld[1]; d[lb + 6] = l.ld[2];
+            d[lb + 7] = static_cast<float>(l.comp);
+            d[lb + 8] = l.att[0]; d[lb + 9] = l.att[1]; d[lb + 10] = l.att[2];
+            d[lb + 11] = l.cutoff;
+            d[lb + 12] = l.lac[0]; d[lb + 13] = l.lac[1]; d[lb + 14] = l.lac[2];
+            d[lb + 15] = l.spot_exp;
+            d[lb + 16] = l.ldc[0]; d[lb + 17] = l.ldc[1]; d[lb + 18] = l.ldc[2];
+            d[lb + 19] = 0.0f;
+            d[lb + 20] = l.lsc[0]; d[lb + 21] = l.lsc[1]; d[lb + 22] = l.lsc[2];
+            d[lb + 23] = 0.0f;
+        }
+    }
+
+    // 69..70: viewport
+    const float offset_x = static_cast<float>(regs_[kOffsetX] & 0xFFFFu) / 16.0f;
+    const float offset_y = static_cast<float>(regs_[kOffsetY] & 0xFFFFu) / 16.0f;
+    d[69 * 4 + 0] = float24(regs_[kViewportXScale]);
+    d[69 * 4 + 1] = float24(regs_[kViewportYScale]);
+    d[69 * 4 + 2] = float24(regs_[kViewportXCenter]) - offset_x;
+    d[69 * 4 + 3] = float24(regs_[kViewportYCenter]) - offset_y;
+    d[70 * 4 + 0] = float24(regs_[kViewportZScale]);
+    d[70 * 4 + 1] = float24(regs_[kViewportZCenter]);
+    d[70 * 4 + 2] = offset_x;
+    d[70 * 4 + 3] = offset_y;
 }
 
 } // namespace mhf::psp::gpu

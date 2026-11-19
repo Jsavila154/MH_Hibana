@@ -101,6 +101,8 @@ using MhfGetFloatv = void(APIENTRY *)(GLenum, GLfloat *);
 using MhfGetStringi = const GLubyte *(APIENTRY *)(GLenum, GLuint);
 using MhfPixelStorei = void(APIENTRY *)(GLenum, GLint);
 using MhfDrawArrays = void(APIENTRY *)(GLenum, GLint, GLsizei);
+using MhfDrawElements = void(APIENTRY *)(GLenum, GLsizei, GLenum, const void *);
+using MhfDrawElementsBaseVertex = void(APIENTRY *)(GLenum, GLsizei, GLenum, const void *, GLint);
 using MhfReadPixels = void(APIENTRY *)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *);
 
 // ---------------------------------------------------------------- OpenGL entry points
@@ -174,7 +176,10 @@ using MhfReadPixels = void(APIENTRY *)(GLint, GLint, GLsizei, GLsizei, GLenum, G
     X(PFNGLDELETESYNCPROC, DeleteSync, glDeleteSync)                                                               \
     X(PFNGLVERTEXATTRIBPOINTERPROC, VertexAttribPointer, glVertexAttribPointer)                                    \
     X(PFNGLENABLEVERTEXATTRIBARRAYPROC, EnableVertexAttribArray, glEnableVertexAttribArray)                        \
+    X(PFNGLUNIFORM4FVPROC, Uniform4fv, glUniform4fv)                                                               \
     X(MhfDrawArrays, DrawArrays, glDrawArrays)                                                                     \
+    X(MhfDrawElements, DrawElements, glDrawElements)                                                               \
+    X(MhfDrawElementsBaseVertex, DrawElementsBaseVertex, glDrawElementsBaseVertex)                                 \
     X(MhfReadPixels, ReadPixels, glReadPixels)
 
 struct Gl {
@@ -455,6 +460,7 @@ out vec2 v_uv;
 out vec4 v_color;
 out vec3 v_spec;
 out float v_fog;
+noperspective out float v_guard;
 void main() {
     float w = 1.0 / a_pos.w;
     vec2 ndc = a_pos.xy / u_target * 2.0 - 1.0;
@@ -464,6 +470,156 @@ void main() {
     v_color = a_color;
     v_spec = a_spec.rgb;
     v_fog = a_fog;
+    v_guard = 0.0;
+}
+)";
+
+constexpr const char *kHwDrawVertex = R"(#version 330 core
+layout(location = 0) in vec3 a_pos;
+layout(location = 1) in vec3 a_normal;
+layout(location = 2) in vec2 a_uv;
+layout(location = 3) in vec4 a_color;
+layout(location = 4) in vec4 a_w0;
+layout(location = 5) in vec4 a_w1;
+uniform vec2 u_target;
+uniform vec4 u_uv_xform;
+uniform vec4 u_state[72];
+out vec2 v_uv;
+out vec4 v_color;
+out vec3 v_spec;
+out float v_fog;
+noperspective out float v_guard;
+
+vec3 mul43_pos(int base, vec3 v) {
+    vec4 p = vec4(v, 1.0);
+    return vec3(dot(u_state[base], p), dot(u_state[base + 1], p), dot(u_state[base + 2], p));
+}
+
+vec3 mul43_vec(int base, vec3 v) {
+    return vec3(dot(u_state[base].xyz, v), dot(u_state[base + 1].xyz, v), dot(u_state[base + 2].xyz, v));
+}
+
+void main() {
+    int skin_count = int(u_state[44].x + 0.5);
+    vec3 obj_pos = a_pos;
+    vec3 obj_nrm = a_normal;
+    if (skin_count > 0) {
+        vec4 w0 = a_w0 * (1.0 / 32768.0);
+        vec4 w1 = a_w1 * (1.0 / 32768.0);
+        vec3 sp = vec3(0.0);
+        vec3 sn = vec3(0.0);
+        for (int i = 0; i < 8; ++i) {
+            if (i >= skin_count) break;
+            float w = (i < 4) ? w0[i] : w1[i - 4];
+            if (w != 0.0) {
+                int b = i * 3;
+                sp += mul43_pos(b, a_pos) * w;
+                sn += mul43_vec(b, a_normal) * w;
+            }
+        }
+        obj_pos = sp;
+        obj_nrm = sn;
+    }
+
+    vec3 world_pos = mul43_pos(24, obj_pos);
+    vec3 view_pos = mul43_pos(27, world_pos);
+    mat4 proj = mat4(u_state[30], u_state[31], u_state[32], u_state[33]);
+    vec4 clip = proj * vec4(view_pos, 1.0);
+
+    vec2 psp_xy_w = clip.xy * u_state[69].xy + u_state[69].zw * clip.w;
+    vec2 ndc_w = psp_xy_w / u_target * 2.0 - clip.w;
+    float psp_z_w = clip.z * u_state[70].x + u_state[70].y * clip.w;
+    float z_w = (psp_z_w / 65535.0) * 2.0 - clip.w;
+    gl_Position = vec4(ndc_w, z_w, clip.w);
+
+    v_guard = 0.0;
+    if (clip.w > 0.0 && clip.z > -clip.w) {
+        vec2 guard_xy = psp_xy_w / clip.w + u_state[70].zw;
+        if (guard_xy.x < 0.0 || guard_xy.x >= 4096.0 || guard_xy.y < 0.0 || guard_xy.y >= 4096.0) {
+            v_guard = 1.0e6;
+        }
+    }
+
+    int tex_packed = int(u_state[38].w + 0.5);
+    int tex_mode = tex_packed & 3;
+    vec2 uv = a_uv * u_state[37].xy + u_state[37].zw;
+    if (tex_mode == 1) {
+        int tex_src = (tex_packed >> 2) & 3;
+        vec4 src = vec4(obj_pos, 1.0);
+        if (tex_src == 1) src = vec4(a_uv, 0.0, 1.0);
+        else if (tex_src >= 2) src = vec4(a_normal, 1.0);
+        vec3 t = vec3(dot(u_state[34], src), dot(u_state[35], src), dot(u_state[36], src));
+        uv = (t.z != 0.0) ? (t.xy / t.z) : t.xy;
+    }
+    v_uv = uv * u_uv_xform.xy + u_uv_xform.zw;
+    v_fog = clamp((view_pos.z + u_state[38].x) * u_state[38].y, 0.0, 1.0);
+
+    if (u_state[39].w > 0.5) {
+        vec4 mat_amb = u_state[40];
+        vec3 mat_diff = u_state[41].rgb;
+        vec3 mat_spec = u_state[42].rgb;
+        int mat_upd = int(u_state[42].w + 0.5);
+        vec4 vc255 = a_color * 255.0;
+        if ((mat_upd & 1) != 0) mat_amb = vc255;
+        if ((mat_upd & 2) != 0) mat_diff = vc255.rgb;
+        if ((mat_upd & 4) != 0) mat_spec = vc255.rgb;
+
+        vec3 wn = mul43_vec(24, obj_nrm);
+        float wnl = length(wn);
+        if (wnl > 0.0) wn /= wnl;
+        if (u_state[44].y > 0.5) wn = -wn;
+
+        vec3 diff_sum = u_state[39].rgb + (u_state[43].rgb * mat_amb.rgb) * (1.0 / 255.0);
+        vec3 spec_sum = vec3(0.0);
+        float alpha_out = (u_state[43].a * mat_amb.a) * (1.0 / 255.0);
+        float shininess = u_state[41].w;
+        for (int i = 0; i < 4; ++i) {
+            int lb = 45 + i * 6;
+            int kind = int(u_state[lb].w + 0.5);
+            if (kind == 0) continue;
+            vec3 lvec = u_state[lb].xyz;
+            float att = 1.0;
+            if (kind >= 2) {
+                lvec = u_state[lb].xyz - world_pos;
+                float d2 = dot(lvec, lvec);
+                float d = sqrt(max(d2, 1e-12));
+                lvec /= d;
+                float denom = u_state[lb + 2].x + u_state[lb + 2].y * d + u_state[lb + 2].z * d2;
+                att = (denom > 0.0) ? min(1.0 / denom, 1.0) : 1.0;
+            } else {
+                float ll = length(lvec);
+                if (ll > 0.0) lvec /= ll;
+            }
+            if (kind == 3) {
+                vec3 sdir = u_state[lb + 1].xyz;
+                float sl = length(sdir);
+                if (sl > 0.0) sdir /= sl;
+                float spot = dot(-lvec, sdir);
+                if (spot < u_state[lb + 2].w) att = 0.0;
+                else att *= pow(max(spot, 0.0), u_state[lb + 3].w);
+            }
+            int comp = int(u_state[lb + 1].w + 0.5);
+            float ndotl = max(0.0, dot(wn, lvec));
+            float d_factor = (comp == 2) ? pow(ndotl, shininess) : ndotl;
+            diff_sum += att * (u_state[lb + 3].rgb * mat_amb.rgb + u_state[lb + 4].rgb * mat_diff * d_factor) * (1.0 / 255.0);
+            if (comp == 1 && ndotl > 0.0) {
+                vec3 h = lvec + vec3(0.0, 0.0, 1.0);
+                float hl = length(h);
+                float sp = (hl > 0.0) ? pow(max(0.0, dot(wn, h / hl)), shininess) : 0.0;
+                spec_sum += att * (u_state[lb + 5].rgb * mat_spec * sp) * (1.0 / 255.0);
+            }
+        }
+        if (u_state[44].z > 0.5) {
+            v_color = vec4(clamp(diff_sum * (1.0 / 255.0), 0.0, 1.0), clamp(alpha_out * (1.0 / 255.0), 0.0, 1.0));
+            v_spec = clamp(spec_sum * (1.0 / 255.0), 0.0, 1.0);
+        } else {
+            v_color = vec4(clamp((diff_sum + spec_sum) * (1.0 / 255.0), 0.0, 1.0), clamp(alpha_out * (1.0 / 255.0), 0.0, 1.0));
+            v_spec = vec3(0.0);
+        }
+    } else {
+        v_color = (u_state[44].w > 0.5) ? a_color : clamp(u_state[40] * (1.0 / 255.0), 0.0, 1.0);
+        v_spec = vec3(0.0);
+    }
 }
 )";
 
@@ -472,6 +628,7 @@ in vec2 v_uv;
 in vec4 v_color;
 in vec3 v_spec;
 in float v_fog;
+noperspective in float v_guard;
 uniform sampler2D u_tex;
 uniform int u_tex_enable;
 uniform int u_tex_func;
@@ -498,6 +655,7 @@ bool compare(int f, int a, int b) {
     return a >= b;
 }
 void main() {
+    if (v_guard > 0.5) discard;
     vec4 c = v_color;
     if (u_clear == 0) {
         if (u_tex_enable != 0) {
@@ -793,7 +951,9 @@ constexpr const char *kBuiltinImage = "builtin:";
 // The `shown` name of a cached texture drawn with its HD text page (the page's texture is not the slot's own).
 constexpr const char *kHdTextImage = "hd-text:";
 
-std::uint8_t to_byte(float v) { return static_cast<std::uint8_t>(std::clamp(v, 0.0f, 255.0f) + 0.5f); }
+constexpr std::uint8_t to_byte(float v) noexcept {
+    return v <= 0.0f ? 0u : (v >= 255.0f ? 255u : static_cast<std::uint8_t>(v + 0.5f));
+}
 
 // ---------------------------------------------------------------- the backend
 
@@ -804,6 +964,9 @@ public:
         : window_(window), scale_(std::max(1, scale)), memory_(memory), live_(live != nullptr ? live : &own_live_),
           overlay_(overlay), factor_(std::clamp(factor, 1, 6)), interpolate_(factor > 1) {
         if (live == nullptr) own_live_.smooth_textures = smooth_textures;
+        if (const char *hw = std::getenv("MHF_HW_TRANSFORM"); hw != nullptr && hw[0] == '0') {
+            live_->hw_transform.store(false, std::memory_order_relaxed);
+        }
         open_texture_pack();
         const char *hud_log = std::getenv("MHF_HUD_LOG");
         hud_log_ = hud_log != nullptr && hud_log[0] == '1';
@@ -824,6 +987,177 @@ public:
         const auto dark_grey = [](float value) { return value >= 15.0f && value <= 35.0f; };
         if (!dark_grey(a.r) || !dark_grey(a.g) || !dark_grey(a.b)) return false;
         return live_ != nullptr && live_->shadow.load(std::memory_order_relaxed);
+    }
+
+    // Hardware transform and lighting (toggled in Video settings or via MHF_HW_TRANSFORM=0). Off when frame
+    // interpolation or projected shadows are active because those modes require CPU-side world/clip coordinates.
+    bool supports_hardware_transform() const noexcept override {
+        return live_ != nullptr && live_->hw_transform.load(std::memory_order_relaxed) && !interpolate_ &&
+               !live_->shadow.load(std::memory_order_relaxed);
+    }
+
+    static constexpr std::size_t kHwVboBytes = 16u * 1024u * 1024u;
+    static constexpr std::size_t kHwIboBytes = 4u * 1024u * 1024u;
+    std::size_t hw_vbo_pos_{}, hw_ibo_pos_{};
+    std::uint64_t gl_state_serial_{1}, hw_emitted_serial_{};
+    DrawKey hw_emitted_key_{};
+    GLuint hw_emitted_tex_{};
+    std::uint32_t hw_emitted_target_{~0u};
+
+    struct HwBatchCmd {
+        DrawSetup setup;
+        gpu::HardwareDrawState state;
+        std::uint32_t first_index{};
+        std::uint32_t index_count{};
+    };
+    std::vector<gpu::HwVertex> hw_batch_verts_;
+    std::vector<std::uint32_t> hw_batch_indices_;
+    std::vector<HwBatchCmd> hw_batch_cmds_;
+
+    void flush_hw_batch() {
+        if (hw_batch_cmds_.empty()) return;
+        const std::size_t vbytes = hw_batch_verts_.size() * sizeof(gpu::HwVertex);
+        const std::size_t ibytes = hw_batch_indices_.size() * sizeof(std::uint32_t);
+        if (vbytes == 0 || ibytes == 0) {
+            hw_batch_verts_.clear();
+            hw_batch_indices_.clear();
+            hw_batch_cmds_.clear();
+            return;
+        }
+
+        gl_.BindVertexArray(hw_vao_);
+        gl_.BindBuffer(GL_ARRAY_BUFFER, hw_vbo_);
+        if (vbytes > kHwVboBytes) {
+            gl_.BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vbytes), hw_batch_verts_.data(), GL_STREAM_DRAW);
+            hw_vbo_pos_ = kHwVboBytes;
+        } else {
+            gl_.BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(kHwVboBytes), nullptr, GL_STREAM_DRAW);
+            void *vp = gl_.MapBufferRange(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(vbytes),
+                                          GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+            if (vp != nullptr) {
+                std::memcpy(vp, hw_batch_verts_.data(), vbytes);
+                gl_.UnmapBuffer(GL_ARRAY_BUFFER);
+            }
+            hw_vbo_pos_ = vbytes;
+        }
+
+        gl_.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, hw_ibo_);
+        if (ibytes > kHwIboBytes) {
+            gl_.BufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(ibytes), hw_batch_indices_.data(), GL_STREAM_DRAW);
+            hw_ibo_pos_ = kHwIboBytes;
+        } else {
+            gl_.BufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(kHwIboBytes), nullptr, GL_STREAM_DRAW);
+            void *ip = gl_.MapBufferRange(GL_ELEMENT_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(ibytes),
+                                          GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+            if (ip != nullptr) {
+                std::memcpy(ip, hw_batch_indices_.data(), ibytes);
+                gl_.UnmapBuffer(GL_ELEMENT_ARRAY_BUFFER);
+            }
+            hw_ibo_pos_ = ibytes;
+        }
+
+        bool have_prev_state = false;
+        DrawKey prev_key{};
+        GLuint prev_tex = 0;
+        std::uint32_t prev_target = ~0u;
+        std::uint64_t prev_hw_serial = 0u;
+
+        for (const HwBatchCmd &cmd : hw_batch_cmds_) {
+            auto it = targets_.find(cmd.setup.target);
+            if (it == targets_.end()) continue;
+            RenderTarget &rt = it->second;
+            rt.last_draw = frame_;
+            if (!have_prev_state || prev_key != cmd.setup.key || prev_tex != cmd.setup.texture ||
+                prev_target != cmd.setup.target) {
+                emit_state(cmd.setup, rt, true);
+                have_prev_state = true;
+                prev_key = cmd.setup.key;
+                prev_tex = cmd.setup.texture;
+                prev_target = cmd.setup.target;
+            }
+            if (prev_hw_serial == 0u || prev_hw_serial != cmd.state.serial) {
+                gl_.Uniform4fv(hw_u_state_, static_cast<GLsizei>(gpu::HardwareDrawState::kVec4Count), cmd.state.data.data());
+                prev_hw_serial = cmd.state.serial;
+            }
+            const std::size_t off = static_cast<std::size_t>(cmd.first_index) * sizeof(std::uint32_t);
+            gl_.DrawElements(GL_TRIANGLES, static_cast<GLsizei>(cmd.index_count), GL_UNSIGNED_INT,
+                             reinterpret_cast<const void *>(off));
+        }
+        hw_emitted_serial_ = 0;
+        hw_batch_verts_.clear();
+        hw_batch_indices_.clear();
+        hw_batch_cmds_.clear();
+    }
+
+    void draw_hardware(const gpu::Ge &ge, const gpu::DrawInfo &draw, const gpu::HardwareDrawState &state,
+                       const gpu::HwVertex *vertices, std::uint32_t vertex_count, const std::uint32_t *indices,
+                       std::uint32_t index_count) override {
+        prepare(ge);
+        if (!batch_.empty()) draw_batch();
+        if (shown_target(setup_.target) && (key_reg(setup_.key, kClearMode) & 1u) == 0) frame_has_3d_ = true;
+        if (targets_.find(setup_.target) == targets_.end()) return;
+
+        // Flush before exceeding the 16 MB VBO staging capacity.
+        if (hw_batch_verts_.size() + vertex_count > 327680u) flush_hw_batch();
+
+        const std::uint32_t base = static_cast<std::uint32_t>(hw_batch_verts_.size());
+        hw_batch_verts_.resize(base + vertex_count);
+        std::memcpy(hw_batch_verts_.data() + base, vertices, static_cast<std::size_t>(vertex_count) * sizeof(gpu::HwVertex));
+
+        const std::uint32_t first_index = static_cast<std::uint32_t>(hw_batch_indices_.size());
+        const bool has_idx = (indices != nullptr && index_count > 0);
+        const std::uint32_t n = has_idx ? index_count : vertex_count;
+        auto get = [&](std::uint32_t i) -> std::uint32_t { return base + (has_idx ? indices[i] : i); };
+
+        std::uint32_t added = 0u;
+        if (draw.primitive == 3u) {
+            added = (n / 3u) * 3u;
+            if (added > 0u) {
+                hw_batch_indices_.resize(first_index + added);
+                std::uint32_t *dst = hw_batch_indices_.data() + first_index;
+                if (has_idx) {
+                    for (std::uint32_t i = 0; i < added; ++i) dst[i] = base + indices[i];
+                } else {
+                    for (std::uint32_t i = 0; i < added; ++i) dst[i] = base + i;
+                }
+            }
+        } else if (draw.primitive == 4u) {
+            if (n >= 3u) {
+                added = (n - 2u) * 3u;
+                hw_batch_indices_.resize(first_index + added);
+                std::uint32_t *dst = hw_batch_indices_.data() + first_index;
+                for (std::uint32_t i = 0; i + 2u < n; ++i) {
+                    const std::uint32_t a = get(i), b = get(i + 1u), c = get(i + 2u);
+                    if ((i & 1u) == 0u) {
+                        *dst++ = a; *dst++ = b; *dst++ = c;
+                    } else {
+                        *dst++ = b; *dst++ = a; *dst++ = c;
+                    }
+                }
+            }
+        } else if (draw.primitive == 5u) {
+            if (n >= 3u) {
+                added = (n - 2u) * 3u;
+                hw_batch_indices_.resize(first_index + added);
+                std::uint32_t *dst = hw_batch_indices_.data() + first_index;
+                const std::uint32_t v0 = get(0u);
+                for (std::uint32_t i = 1u; i + 1u < n; ++i) {
+                    *dst++ = v0; *dst++ = get(i); *dst++ = get(i + 1u);
+                }
+            }
+        }
+
+        if (added == 0u) return;
+
+        if (!hw_batch_cmds_.empty()) {
+            HwBatchCmd &prev = hw_batch_cmds_.back();
+            if (prev.setup.key == setup_.key && prev.setup.texture == setup_.texture &&
+                prev.setup.target == setup_.target && prev.state.serial == state.serial) {
+                prev.index_count += added;
+                return;
+            }
+        }
+        hw_batch_cmds_.push_back(HwBatchCmd{setup_, state, first_index, added});
     }
 
     void triangle(const gpu::Ge &ge, const gpu::Vertex &a, const gpu::Vertex &b, const gpu::Vertex &c) override {
@@ -1086,7 +1420,9 @@ private:
         // Texture packs hash 512-tall textures drawn in through mode only down to the lowest row drawn.
         if (seen_v_ != nullptr && through_ && v.v > static_cast<float>(*seen_v_)) *seen_v_ = static_cast<std::uint16_t>(std::min(512.0f, std::ceil(v.v)));
         g.color[0] = to_byte(c.r); g.color[1] = to_byte(c.g); g.color[2] = to_byte(c.b); g.color[3] = to_byte(c.a);
-        g.spec[0] = to_byte(c.sr); g.spec[1] = to_byte(c.sg); g.spec[2] = to_byte(c.sb); g.spec[3] = 0;
+        if (c.sr != 0.0f || c.sg != 0.0f || c.sb != 0.0f) {
+            g.spec[0] = to_byte(c.sr); g.spec[1] = to_byte(c.sg); g.spec[2] = to_byte(c.sb);
+        }
         g.fog = v.fog;
         if (batch_.empty()) batch_layer_ = draw_layer_;
         batch_.push_back(g);
@@ -1133,7 +1469,7 @@ private:
                      float t) const;
 
     void apply_state(const gpu::Ge &ge);
-    void emit_state(const DrawSetup &setup, RenderTarget &rt);
+    void emit_state(const DrawSetup &setup, RenderTarget &rt, bool hardware = false);
     void draw_vertices(const std::vector<GpuVertex> &vertices);
     void show(GLuint texture, float uv_max_x, float uv_max_y);
     void finish_flip();
@@ -1226,11 +1562,13 @@ private:
     std::uint64_t overlay_shown_at_{}; // SDL ticks (ms) when it appeared, for the fade-in
     Gl gl_;
 
-    GLuint draw_program_{}, present_program_{}, vao_{}, vbo_{}, empty_vao_{};
-    struct {
+    GLuint draw_program_{}, hw_program_{}, present_program_{}, vao_{}, vbo_{}, hw_vao_{}, hw_vbo_{}, hw_ibo_{}, empty_vao_{};
+    struct DrawUniforms {
         GLint target, uv_xform, tex_enable, tex_func, tex_rgba, tex_double, env, clear, fog_enable, fog_color,
             alpha_func, alpha_ref, alpha_mask, zrange_enable, zrange, tex;
-    } u_{};
+    };
+    DrawUniforms u_{}, hw_u_{};
+    GLint hw_u_state_{-1};
     GLint present_uv_max_{}, present_tex_{};
 
     std::map<std::uint32_t, RenderTarget> targets_; // by VRAM offset
@@ -1633,10 +1971,12 @@ bool GlBackend::init() {
                      static_cast<double>(anisotropy_), pack_mips_ ? "made" : "the pack's own");
     }
     draw_program_ = compile(kDrawVertex, kDrawFragment);
+    hw_program_ = compile(kHwDrawVertex, kDrawFragment);
     present_program_ = compile(kPresentVertex, kPresentFragment);
     overlay_program_ = compile(kPresentVertex, kOverlayFragment);
     blur_program_ = compile(kBlurVertex, kBlurFragment);
-    if (draw_program_ == 0 || present_program_ == 0 || overlay_program_ == 0 || blur_program_ == 0) return false;
+    if (draw_program_ == 0 || hw_program_ == 0 || present_program_ == 0 || overlay_program_ == 0 || blur_program_ == 0)
+        return false;
     blur_uv_off_ = uniform(blur_program_, "u_uv_off");
     blur_uv_scale_ = uniform(blur_program_, "u_uv_scale");
     blur_tex_ = uniform(blur_program_, "u_tex");
@@ -1646,22 +1986,27 @@ bool GlBackend::init() {
     overlay_alpha_ = uniform(overlay_program_, "u_alpha");
     overlay_uv_max_ = uniform(overlay_program_, "u_uv_max");
     gl_.GenTextures(1, &overlay_texture_);
-    u_.target = uniform(draw_program_, "u_target");
-    u_.uv_xform = uniform(draw_program_, "u_uv_xform");
-    u_.tex_enable = uniform(draw_program_, "u_tex_enable");
-    u_.tex_func = uniform(draw_program_, "u_tex_func");
-    u_.tex_rgba = uniform(draw_program_, "u_tex_rgba");
-    u_.tex_double = uniform(draw_program_, "u_tex_double");
-    u_.env = uniform(draw_program_, "u_env");
-    u_.clear = uniform(draw_program_, "u_clear");
-    u_.fog_enable = uniform(draw_program_, "u_fog_enable");
-    u_.fog_color = uniform(draw_program_, "u_fog_color");
-    u_.alpha_func = uniform(draw_program_, "u_alpha_func");
-    u_.alpha_ref = uniform(draw_program_, "u_alpha_ref");
-    u_.alpha_mask = uniform(draw_program_, "u_alpha_mask");
-    u_.zrange_enable = uniform(draw_program_, "u_zrange_enable");
-    u_.zrange = uniform(draw_program_, "u_zrange");
-    u_.tex = uniform(draw_program_, "u_tex");
+    auto query_draw_uniforms = [&](GLuint prog, DrawUniforms &out) {
+        out.target = uniform(prog, "u_target");
+        out.uv_xform = uniform(prog, "u_uv_xform");
+        out.tex_enable = uniform(prog, "u_tex_enable");
+        out.tex_func = uniform(prog, "u_tex_func");
+        out.tex_rgba = uniform(prog, "u_tex_rgba");
+        out.tex_double = uniform(prog, "u_tex_double");
+        out.env = uniform(prog, "u_env");
+        out.clear = uniform(prog, "u_clear");
+        out.fog_enable = uniform(prog, "u_fog_enable");
+        out.fog_color = uniform(prog, "u_fog_color");
+        out.alpha_func = uniform(prog, "u_alpha_func");
+        out.alpha_ref = uniform(prog, "u_alpha_ref");
+        out.alpha_mask = uniform(prog, "u_alpha_mask");
+        out.zrange_enable = uniform(prog, "u_zrange_enable");
+        out.zrange = uniform(prog, "u_zrange");
+        out.tex = uniform(prog, "u_tex");
+    };
+    query_draw_uniforms(draw_program_, u_);
+    query_draw_uniforms(hw_program_, hw_u_);
+    hw_u_state_ = uniform(hw_program_, "u_state");
     present_uv_max_ = uniform(present_program_, "u_uv_max");
     present_tex_ = uniform(present_program_, "u_tex");
 
@@ -1677,6 +2022,24 @@ bool GlBackend::init() {
     gl_.VertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride, reinterpret_cast<void *>(offsetof(GpuVertex, spec)));
     gl_.VertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void *>(offsetof(GpuVertex, fog)));
     for (GLuint i = 0; i < 5; ++i) gl_.EnableVertexAttribArray(i);
+
+    gl_.GenVertexArrays(1, &hw_vao_);
+    gl_.GenBuffers(1, &hw_vbo_);
+    gl_.GenBuffers(1, &hw_ibo_);
+    gl_.BindVertexArray(hw_vao_);
+    gl_.BindBuffer(GL_ARRAY_BUFFER, hw_vbo_);
+    gl_.BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(kHwVboBytes), nullptr, GL_STREAM_DRAW);
+    gl_.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, hw_ibo_);
+    gl_.BufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(kHwIboBytes), nullptr, GL_STREAM_DRAW);
+    const auto hw_stride = static_cast<GLsizei>(sizeof(gpu::HwVertex));
+    gl_.VertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, hw_stride, reinterpret_cast<void *>(offsetof(gpu::HwVertex, pos)));
+    gl_.VertexAttribPointer(1, 3, GL_SHORT, GL_TRUE, hw_stride, reinterpret_cast<void *>(offsetof(gpu::HwVertex, normal)));
+    gl_.VertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, hw_stride, reinterpret_cast<void *>(offsetof(gpu::HwVertex, uv)));
+    gl_.VertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, hw_stride, reinterpret_cast<void *>(offsetof(gpu::HwVertex, color)));
+    gl_.VertexAttribPointer(4, 4, GL_UNSIGNED_SHORT, GL_FALSE, hw_stride, reinterpret_cast<void *>(offsetof(gpu::HwVertex, weights)));
+    gl_.VertexAttribPointer(5, 4, GL_UNSIGNED_SHORT, GL_FALSE, hw_stride,
+                            reinterpret_cast<void *>(offsetof(gpu::HwVertex, weights) + 4 * sizeof(std::uint16_t)));
+    for (GLuint i = 0; i < 6; ++i) gl_.EnableVertexAttribArray(i);
 
     GLuint textures[4];
     gl_.GenTextures(4, textures);
@@ -1910,10 +2273,10 @@ GLuint GlBackend::texture_for(const gpu::Ge &ge, float uv_xform[4]) {
     std::uint64_t key = info.address;
     key = key * 1315423911u ^ (static_cast<std::uint64_t>(info.format) << 40u) ^ (static_cast<std::uint64_t>(info.width) << 20u) ^
           info.height ^ (static_cast<std::uint64_t>(info.stride) << 48u) ^ (info.swizzled ? 0x8000000000000000ull : 0u);
-    if (indexed) key ^= static_cast<std::uint64_t>(ge.reg(kClutFormat)) * 0x9E3779B97F4A7C15ull;
+    if (indexed) key ^= (static_cast<std::uint64_t>(ge.reg(kClutFormat)) * 0x9E3779B97F4A7C15ull) ^ ge.clut_hash();
     CachedTexture &t = textures_[key];
     t.last_use = frame_;
-    const bool stale = t.texture == 0 || t.checked_frame != frame_ || (indexed && t.checked_clut != ge.clut_generation());
+    const bool stale = t.texture == 0 || t.checked_frame != frame_;
     if (stale) {
         const std::uint64_t hash = ge.texture_hash();
         t.checked_frame = frame_;
@@ -2535,6 +2898,7 @@ GLenum blend_factor(std::uint32_t f, bool source_side, std::uint32_t fixed, bool
 }
 
 void GlBackend::apply_state(const gpu::Ge &ge) {
+    ++gl_state_serial_;
     DrawSetup setup;
     setup.key = state_key_;
     const std::uint32_t fb = ge.reg(kFramebufPtr) & 0x1FFFF0u;
@@ -4083,15 +4447,17 @@ void GlBackend::apply_shadow(RenderTarget &rt, const ShadowPass &p, const float 
     gl_.ActiveTexture(GL_TEXTURE0);
 }
 
-void GlBackend::emit_state(const DrawSetup &setup, RenderTarget &rt) {
+void GlBackend::emit_state(const DrawSetup &setup, RenderTarget &rt, bool hardware) {
+    if (!hardware) ++gl_state_serial_;
     const auto R = [&](std::uint32_t reg) { return key_reg(setup.key, reg); };
     const std::uint32_t sx1 = R(kScissor1) & 0x3FFu, sy1 = (R(kScissor1) >> 10u) & 0x3FFu;
     const std::uint32_t sx2 = R(kScissor2) & 0x3FFu, sy2 = (R(kScissor2) >> 10u) & 0x3FFu;
     const bool through = setup.through;
     const float *uv_xform = setup.uv_xform;
+    const DrawUniforms &u = hardware ? hw_u_ : u_;
 
-    gl_.UseProgram(draw_program_);
-    gl_.BindVertexArray(vao_);
+    gl_.UseProgram(hardware ? hw_program_ : draw_program_);
+    gl_.BindVertexArray(hardware ? hw_vao_ : vao_);
 
     const bool clear = (R(kClearMode) & 1u) != 0;
     const bool textured = !clear && (R(kTextureMapEnable) & 1u) != 0;
@@ -4128,10 +4494,10 @@ void GlBackend::emit_state(const DrawSetup &setup, RenderTarget &rt) {
                     static_cast<GLsizei>(x2 - sx1 + 1u) * scale_, static_cast<GLsizei>(y2 - sy1 + 1u) * scale_);
     }
 
-    gl_.Uniform2f(u_.target, static_cast<float>(rt.width), static_cast<float>(rt.height));
-    gl_.Uniform4f(u_.uv_xform, uv_xform[0], uv_xform[1], uv_xform[2], uv_xform[3]);
-    gl_.Uniform1i(u_.clear, clear ? 1 : 0);
-    gl_.Uniform1i(u_.tex_enable, textured ? 1 : 0);
+    gl_.Uniform2f(u.target, static_cast<float>(rt.width), static_cast<float>(rt.height));
+    gl_.Uniform4f(u.uv_xform, uv_xform[0], uv_xform[1], uv_xform[2], uv_xform[3]);
+    gl_.Uniform1i(u.clear, clear ? 1 : 0);
+    gl_.Uniform1i(u.tex_enable, textured ? 1 : 0);
 
     if (clear) {
         const std::uint32_t cm = R(kClearMode);
@@ -4141,36 +4507,36 @@ void GlBackend::emit_state(const DrawSetup &setup, RenderTarget &rt) {
         gl_.Enable(GL_DEPTH_TEST);
         gl_.DepthFunc(GL_ALWAYS);
         gl_.DepthMask(depth ? GL_TRUE : GL_FALSE);
-        gl_.Uniform1i(u_.alpha_func, 1);
-        gl_.Uniform1i(u_.zrange_enable, 0);
+        gl_.Uniform1i(u.alpha_func, 1);
+        gl_.Uniform1i(u.zrange_enable, 0);
         return;
     }
 
     const std::uint32_t func = R(kTexFunc);
-    gl_.Uniform1i(u_.tex_func, static_cast<GLint>(func & 7u));
-    gl_.Uniform1i(u_.tex_rgba, (func & 0x100u) != 0 ? 1 : 0);
-    gl_.Uniform1i(u_.tex_double, (func & 0x10000u) != 0 ? 1 : 0);
+    gl_.Uniform1i(u.tex_func, static_cast<GLint>(func & 7u));
+    gl_.Uniform1i(u.tex_rgba, (func & 0x100u) != 0 ? 1 : 0);
+    gl_.Uniform1i(u.tex_double, (func & 0x10000u) != 0 ? 1 : 0);
     float env[3];
     unpack_rgb(R(kTexEnvColor), env);
-    gl_.Uniform3f(u_.env, env[0], env[1], env[2]);
+    gl_.Uniform3f(u.env, env[0], env[1], env[2]);
     const bool fog = !through && (R(kFogEnable) & 1u) != 0;
-    gl_.Uniform1i(u_.fog_enable, fog ? 1 : 0);
+    gl_.Uniform1i(u.fog_enable, fog ? 1 : 0);
     float fog_color[3];
     unpack_rgb(R(kFogColor), fog_color);
-    gl_.Uniform3f(u_.fog_color, fog_color[0], fog_color[1], fog_color[2]);
+    gl_.Uniform3f(u.fog_color, fog_color[0], fog_color[1], fog_color[2]);
 
     if ((R(kAlphaTestEnable) & 1u) != 0) {
         const std::uint32_t at = R(kAlphaTest);
-        gl_.Uniform1i(u_.alpha_func, static_cast<GLint>(at & 7u));
-        gl_.Uniform1i(u_.alpha_ref, static_cast<GLint>((at >> 8u) & 0xFFu));
-        gl_.Uniform1i(u_.alpha_mask, static_cast<GLint>((at >> 16u) & 0xFFu));
+        gl_.Uniform1i(u.alpha_func, static_cast<GLint>(at & 7u));
+        gl_.Uniform1i(u.alpha_ref, static_cast<GLint>((at >> 8u) & 0xFFu));
+        gl_.Uniform1i(u.alpha_mask, static_cast<GLint>((at >> 16u) & 0xFFu));
     } else {
-        gl_.Uniform1i(u_.alpha_func, 1);
+        gl_.Uniform1i(u.alpha_func, 1);
     }
     const std::uint32_t minz = R(kMinZ) & 0xFFFFu, maxz = R(kMaxZ) & 0xFFFFu;
     const bool zrange = !through && maxz != 0 && (minz != 0 || maxz != 0xFFFFu);
-    gl_.Uniform1i(u_.zrange_enable, zrange ? 1 : 0);
-    gl_.Uniform2f(u_.zrange, static_cast<float>(minz), static_cast<float>(maxz));
+    gl_.Uniform1i(u.zrange_enable, zrange ? 1 : 0);
+    gl_.Uniform2f(u.zrange, static_cast<float>(minz), static_cast<float>(maxz));
 
     // Depth.
     if ((R(kZTestEnable) & 1u) != 0) {
@@ -4217,6 +4583,7 @@ void GlBackend::emit_state(const DrawSetup &setup, RenderTarget &rt) {
 }
 
 void GlBackend::flush() {
+    flush_hw_batch();
     draw_batch();
     // Testing aid: MHF_GL_READBACK=1 copies drawn targets back into guest VRAM after every list, so that tests that
     // read pixels (homebrew/getest) can check the hardware renderer too.
@@ -4251,6 +4618,7 @@ void GlBackend::read_back() {
 
 void GlBackend::draw_batch() {
     if (batch_.empty() && raw_batch_.empty()) return;
+    flush_hw_batch();
     if (setup_.through && !batch_.empty()) {
         size_hud();
     } else if (!batch_.empty() && shown_target(setup_.target)) {
@@ -4762,6 +5130,7 @@ void GlBackend::copy_to_ram(RenderTarget &from, std::uint32_t src, std::uint32_t
 void GlBackend::block_transfer(std::uint32_t src, std::uint32_t /*src_stride: the target's own*/, std::uint32_t sx, std::uint32_t sy,
                                std::uint32_t dst, std::uint32_t dst_stride, std::uint32_t dx, std::uint32_t dy,
                                std::uint32_t width, std::uint32_t height, std::uint32_t bpp) {
+    flush_hw_batch();
     draw_batch();
     have_state_ = false; // GL state is changed below
     const bool src_vram = (src & 0x0F000000u) == 0x04000000u, dst_vram = (dst & 0x0F000000u) == 0x04000000u;
@@ -4816,6 +5185,7 @@ void GlBackend::block_transfer(std::uint32_t src, std::uint32_t /*src_stride: th
 }
 
 void GlBackend::present(std::uint32_t address, std::uint32_t stride, std::uint32_t pixel_format) {
+    flush_hw_batch();
     draw_batch();
     have_state_ = false;
     flush_pictures(); // pictures of the previous flip that never got their turn
