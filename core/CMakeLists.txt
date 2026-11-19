@@ -3,6 +3,8 @@ add_library(mhf_core STATIC
     base/version.cpp
     host/keymap.cpp
     host/padmap.cpp
+    mods/mod_registry.cpp
+    mods/data_mod_parser.cpp
 )
 target_include_directories(mhf_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(mhf_core PRIVATE MHF_VERSION_STRING="${PROJECT_VERSION}")
@@ -55,6 +57,11 @@ if(MHF_BUILD_TESTS)
     target_link_libraries(test_local_network PRIVATE mhf_net)
     mhf_target_warnings(test_local_network)
     add_test(NAME net_local_network COMMAND test_local_network)
+
+    add_executable(test_mods tests/test_mods.cpp)
+    target_link_libraries(test_mods PRIVATE mhf_core)
+    mhf_target_warnings(test_mods)
+    add_test(NAME core_mods COMMAND test_mods)
 endif()
 
 # Launcher entry point. For now it only reports its version; see docs/07-launcher-ux.md.

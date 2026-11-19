@@ -4,6 +4,7 @@
 // mixed audio. Used by the game executables and the homebrew runner when a window is wanted.
 
 #include "mhf/psp/runtime.hpp"
+#include "mods/mod.hpp"
 #include "overlay/song_panel.hpp"
 
 // host/keymap.hpp and host/padmap.hpp are not included here on purpose: the PSP runtime and the homebrew runners include this
@@ -90,6 +91,8 @@ public:
         std::function<void(int)> changed; // runs on the game's thread when the player changes it
     };
     void add_game_option(GameOption option);
+    // Registers the mod registry shown in the in-game Mods tab (and optional config file path for persistence).
+    void set_mods(core::mods::ModRegistry *registry, std::string config_path = {});
     // The hunting horn's songs (overlay/song_panel.hpp), from the `extra` poll: shown at their place while the game draws
     // its quest HUD and no menu, system dialog or notice is up; std::nullopt (no horn, not in a quest) hides them. Only
     // the OpenGL renderer finds the quest HUD, so the software renderer never shows them.

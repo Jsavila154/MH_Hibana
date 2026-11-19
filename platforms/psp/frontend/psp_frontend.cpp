@@ -149,6 +149,8 @@ struct Frontend::Impl {
     std::chrono::steady_clock::time_point notice_until{};
     bool notice_shown{};
     std::vector<std::string> in_my_room; // the keys of the friends playing in the player's room, last time looked
+    core::mods::ModRegistry *mods{nullptr};
+    std::filesystem::path mods_config;
     // The hunting horn's songs (set_song_panel), drawn by the worker at the player's place while the quest HUD is up.
     // Only the newest matters: `songs` from the host, `songs_shown` what the worker was last asked to show (std::nullopt:
     // nothing), `songs_pending` the worker's next job (an empty view takes them down).
@@ -401,6 +403,11 @@ void Frontend::offer_songs(bool on, overlay::SongSpot spot) {
 }
 
 void Frontend::add_game_option(GameOption option) { impl_->game_options.push_back(std::move(option)); }
+
+void Frontend::set_mods(core::mods::ModRegistry *registry, std::string config_path) {
+    impl_->mods = registry;
+    impl_->mods_config = std::move(config_path);
+}
 
 void Frontend::set_mouse_look(std::function<bool()> wanted) { impl_->mouse_look = std::move(wanted); }
 
@@ -662,10 +669,11 @@ void update_dialogs(Frontend::Impl &impl, Runtime &rt) {
 
 enum MenuId {
     kResume = 1, kQuit, kQuitYes, kQuitNo, kMusic, kSfx, kScale, kFps, kFullscreen, kSmooth, kTexturePack, kHudSize, kSongPlace, kSongMove, kPadStick, kRestoreKeys, kRestorePad,
-    kHalls, kRoomCode, kJoinRoom, kServer, kFriendsMore, kSongsOn, kPackMipmaps, kAnisotropy, kShadow, kShadowStrength, kShadowWholeMap, kShadowQuality, kWidescreen
+    kHalls, kRoomCode, kJoinRoom, kServer, kFriendsMore, kSongsOn, kPackMipmaps, kAnisotropy, kShadow, kShadowStrength, kShadowWholeMap, kShadowQuality, kWidescreen, kHwTransform
 };
 constexpr int kGameOptionBase = 3000; // the Game tab's options of the game: kGameOptionBase + an index into Impl::game_options
 constexpr int kFriendBase = 4000; // the Online tab's friend rows: kFriendBase + an index into Impl::friends
+constexpr int kModBase = 5000;    // the Mods tab's toggles: kModBase + an index into ModRegistry::mods()
 
 // The ad hoc servers the Online section offers: the launcher's list (launcher/ui/src/servers.ts, keep the two alike).
 struct AdhocServerChoice {
@@ -981,6 +989,11 @@ overlay::MenuView menu_main(const Frontend::Impl &impl) {
                                       menu_item(Kind::Toggle, kFullscreen, "Fullscreen", impl.host.window_rect().fullscreen ? 1 : 0),
                                       menu_item(Kind::Toggle, kSmooth, "Smooth textures", impl.live.smooth_textures ? 1 : 0)},
                            "Changes apply immediately."};
+    if (impl.gpu_state == 1) {
+        overlay::MenuItem hwt = menu_item(Kind::Toggle, kHwTransform, "GPU hardware transform", impl.live.hw_transform ? 1 : 0);
+        hwt.detail = "Runs 3D skinning, lighting and transform on the GPU (active at 30 fps with shadows off).";
+        video.items.push_back(hwt);
+    }
     if (impl.gpu_state == 1 && impl.widescreen_offered) { // the GPU renderer stretches the picture; the software one draws the PSP's screen as it is
         overlay::MenuItem wide = menu_item(Kind::Toggle, kWidescreen, "Widescreen", impl.live.widescreen ? 1 : 0);
         wide.detail = "Fills wide windows and screens with a wider view.";
@@ -1051,6 +1064,25 @@ overlay::MenuView menu_main(const Frontend::Impl &impl) {
     controls.items.push_back(stick);
     controls.items.push_back(menu_item(Kind::Button, kRestorePad, "Restore controller defaults"));
     v.tabs = {game, audio, video, controls};
+    if (impl.mods != nullptr && !impl.mods->mods().empty()) {
+        overlay::MenuTab mods_tab{"Mods", {}, "Enable or disable mods. Gameplay mods suspend automatically online."};
+        const auto &list = impl.mods->mods();
+        for (std::size_t i = 0; i < list.size(); ++i) {
+            const auto &m = list[i];
+            const auto &mi = m->info();
+            overlay::MenuItem row = menu_item(Kind::Toggle, kModBase + static_cast<int>(i), mi.name, m->is_enabled() ? 1 : 0);
+            row.detail = mi.description;
+            if (!mi.status_note.empty()) {
+                if (!row.detail.empty()) row.detail += " ";
+                row.detail += "[" + mi.status_note + "]";
+            } else if (mi.requires_zone_reload) {
+                if (!row.detail.empty()) row.detail += " ";
+                row.detail += "[Reload zone]";
+            }
+            mods_tab.items.push_back(std::move(row));
+        }
+        v.tabs.push_back(std::move(mods_tab));
+    }
     if (impl.online) v.tabs.push_back(menu_online(impl));
     return v;
 }
@@ -1404,6 +1436,15 @@ bool menu_handle(Frontend::Impl &impl, Runtime &rt, const overlay::Menu::Event &
         refresh_menu(impl);
         return true;
     case overlay::Menu::Event::Kind::Changed:
+        if (e.id >= kModBase && impl.mods != nullptr &&
+            e.id < kModBase + static_cast<int>(impl.mods->mods().size())) {
+            const std::size_t idx = static_cast<std::size_t>(e.id - kModBase);
+            const std::string id = impl.mods->mods()[idx]->info().id;
+            impl.mods->set_enabled(id, e.value != 0);
+            if (!impl.mods_config.empty()) impl.mods->save(impl.mods_config);
+            refresh_menu(impl);
+            return true;
+        }
         if (e.id >= kGameOptionBase && e.id < kGameOptionBase + static_cast<int>(impl.game_options.size())) {
             Frontend::GameOption &o = impl.game_options[static_cast<std::size_t>(e.id - kGameOptionBase)];
             o.value = o.slider ? std::clamp(e.value, o.min, o.max) : (e.value != 0 ? 1 : 0);
@@ -1458,6 +1499,9 @@ bool menu_handle(Frontend::Impl &impl, Runtime &rt, const overlay::Menu::Event &
             impl.live.widescreen = e.value != 0;
             impl.widescreen_known = true;
             save_controls(impl); // the launcher keeps it for the next time
+            break;
+        case kHwTransform:
+            impl.live.hw_transform.store(e.value != 0, std::memory_order_relaxed);
             break;
         case kHudSize:
             if (e.value >= 0 && e.value < static_cast<int>(std::size(kHudSizes))) {
