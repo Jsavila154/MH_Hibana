@@ -68,6 +68,10 @@ void check_release(const std::string &disc_id, const std::vector<std::string> &o
     // makes its culling planes, in every release.
     std::set<std::string> smithy_patches, camera_patches, aspect_patches;
     for (const auto &p : mhf::psp::recomp::region_patches(map_path)) {
+        if (p.patch.name.starts_with("mh_mod_")) {
+            MHF_CHECK(p.patch.kind == mhf::psp::recomp::InstructionPatch::Kind::Call);
+            continue;
+        }
         if (p.patch.name.starts_with("mh_smithy_")) {
             MHF_CHECK(p.module == "lobby_task.ovl");
             smithy_patches.insert(p.patch.name);

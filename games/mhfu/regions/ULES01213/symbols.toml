@@ -71,6 +71,9 @@ mh_smithy_question_box   = 0x09B041C8 # the question box: position, size, then i
 mh_smithy_skill_info_hint = 0x09B04238 # 1 pair: where the Skill Info hint ends (it is right-aligned)
 mh_smithy_model_scissor  = 0x09B085D0 # first entry: the screen rectangle the weapon model is drawn in
 mh_smithy_panel_draw_entry = 0x09A83BD8 # mh_smithy_panel_draw, which the game program also calls (both panels at once)
+mh_armor_price           = 0x0885C968 # (GameSys*, type, id) -> zenny cost
+mh_armor_owned_check     = 0x0885CB98 # (GameSys*, type, id) -> owned/craftable flags
+mh_forge_materials_check = 0x0885DFA0 # (GameSys*, kind, recipe_idx, mode) -> bool
 mh_pad_input             = 0x08A62C64 # Pad*: this frame's buttons and sticks as the game reads them (s8 stick x at +2, y at +4)
 mh_draw_done             = 0x08A62C45 # u8: set when the game's drawing for the frame is done (mh_draw_wait waits for it)
 
@@ -107,3 +110,14 @@ mh_camera_aspect_reset = "executable 0x08812BC4 call" # a camera is set up again
 # The camera's update makes its culling planes (camera + 3408..3471, in view space) right before this: the
 # game draws a character or a prop only inside them (found 2026-11-12, an NPC vanishing at the edges in 32:9).
 mh_camera_aspect_culling = "executable 0x08814664 call" # the culling planes are made (s0 is the camera)
+
+# Craftable training-school piercings mod (Smithy Head list append + recipe table extension).
+mh_mod_piercings_unlock_ptr  = "executable 0x0885E068 call"
+mh_mod_piercings_list_end    = "lobby_task.ovl 0x09AA2C44 call"
+mh_mod_piercings_panel_ptr   = "lobby_task.ovl 0x09A83D50 call"
+mh_mod_piercings_consume_ptr = "lobby_task.ovl 0x09AA5C10 call"
+
+# Dev Sandbox mod (unlock all Smithy recipes, unlimited zenny/materials for testing).
+mh_mod_dev_forge_unlock = "executable 0x0885E1D4 call"
+mh_mod_dev_zenny_check  = "lobby_task.ovl 0x09A800F4 call"
+mh_mod_dev_free_craft   = "lobby_task.ovl 0x09AA5C98 call"

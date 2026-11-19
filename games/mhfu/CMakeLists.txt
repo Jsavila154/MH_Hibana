@@ -56,7 +56,7 @@ if(MHF_MHFU_GENERATED)
     else()
         target_compile_options(mhfu_generated PRIVATE -w -O1)
     endif()
-    add_executable(mhfu host/main.cpp host/horn_songs.cpp)
+    add_executable(mhfu host/main.cpp host/horn_songs.cpp host/piercings_mod.cpp host/dev_sandbox_mod.cpp)
     # One program per region; the launcher picks it by the disc (launcher.cpp, game_program_name).
     set(MHF_MHFU_PROGRAM_NAME "mhfu" CACHE STRING "File name of the Freedom Unite program: mhfu (EU), mhfu-us (NA), mhfu-jp (JP) or mhfu-fuc (FUComplete)")
     set_target_properties(mhfu PROPERTIES OUTPUT_NAME ${MHF_MHFU_PROGRAM_NAME})

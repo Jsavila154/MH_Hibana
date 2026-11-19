@@ -21,12 +21,17 @@
 #include "mhf/psp/frame_dump.hpp"
 #include "mhf/psp/generated.hpp"
 #include "mhf/psp/host.hpp"
+#include "mhf/psp/patch_engine.hpp"
 #include "mhf/psp/runtime.hpp"
+#include "mods/data_mod_parser.hpp"
+#include "mods/mod.hpp"
 #include "iso9660.hpp"
 #include "param_sfo.hpp"
 
 #include "host/keymap.hpp"
 #include "host/padmap.hpp"
+#include "dev_sandbox_mod.hpp"
+#include "piercings_mod.hpp"
 
 #if !__has_include("mhfu_region_data.hpp")
 #error "mhfu_region_data.hpp is missing from MHF_MHFU_GENERATED: re-run games/mhfu/tools/prepare.py"
@@ -207,12 +212,17 @@ std::vector<ScriptedPress> parse_input_script(const std::string &text) {
 
 // Hook on mh_overlay_prepare(image, size): the overlay image (header included) is already in guest memory and its
 // static initializers are about to run, so its recompiled code must become the active one for its region now.
+mhf::core::mods::ModRegistry *g_mods_registry{nullptr};
+
 void on_overlay_prepare(Runtime &rt, Context &ctx) {
     const std::uint32_t image = ctx.gpr[4];
     const auto overlay_id = static_cast<std::int32_t>(rt.memory().load32(image + 4));
     const bool ok = rt.activate_overlay(overlay_id);
     if (g_log_overlays || !ok) {
         std::fprintf(stderr, "[mhfu] overlay %d %s at %08X\n", overlay_id, ok ? "activated" : "UNKNOWN", image);
+    }
+    if (ok && g_mods_registry != nullptr) {
+        g_mods_registry->on_overlay_loaded("overlay_" + std::to_string(overlay_id));
     }
 }
 
@@ -1058,6 +1068,40 @@ int main(int argc, char **argv) {
             runtime.add_overlay(*programs[i]);
         }
         runtime.register_hook("mh_overlay_prepare", &on_overlay_prepare);
+        // Mod registry + file-based data mods (mods/*/mod.toml). Loaded before frontend attaches so the Mods tab
+        // shows all discovered mods and restores their persisted enabled state.
+        mhf::core::mods::ModRegistry mod_registry;
+        mhf::psp::PatchEngine patch_engine(runtime.memory());
+        g_mods_registry = &mod_registry;
+        mod_registry.register_mod(std::make_unique<mhf::mhfu::CraftablePiercingsMod>(runtime));
+        mod_registry.register_mod(std::make_unique<mhf::mhfu::DevSandboxMod>(runtime));
+        const std::string product_code = disc_product_code(options.disc_image);
+        const auto scan_mods_dir = [&](const std::filesystem::path &dir) {
+            std::error_code ec;
+            if (!std::filesystem::is_directory(dir, ec)) return;
+            for (const auto &entry : std::filesystem::directory_iterator(dir, ec)) {
+                if (!entry.is_directory(ec)) continue;
+                const auto manifest_path = entry.path() / "mod.toml";
+                if (!std::filesystem::is_regular_file(manifest_path, ec)) continue;
+                mhf::core::mods::DataModManifest manifest;
+                std::string error;
+                if (!mhf::core::mods::parse_data_mod_toml(manifest_path, manifest, error)) {
+                    std::fprintf(stderr, "[mhfu] mod '%s' skipped: %s\n",
+                                 manifest_path.string().c_str(), error.c_str());
+                    continue;
+                }
+                if (!manifest.region.empty() && manifest.region != product_code) {
+                    continue;
+                }
+                mod_registry.register_mod(std::make_unique<mhf::psp::DataMod>(std::move(manifest), patch_engine));
+            }
+        };
+        scan_mods_dir(std::filesystem::path("mods"));
+        if (!options.memstick_root.empty()) scan_mods_dir(options.memstick_root / "mods");
+        const std::filesystem::path mods_config_path =
+            options.memstick_root.empty() ? std::filesystem::path("mods.cfg") : (options.memstick_root / "mods.cfg");
+        mod_registry.load(mods_config_path);
+        mod_registry.set_online_active(!options.adhoc_server.empty());
         // Hooks that read a switch every time, so the in-game menu can turn their enhancement on and off.
         g_fast_supply_box = fast_supply_box;
         runtime.register_hook("mh_supply_box_update", &on_supply_box_update);
@@ -1229,10 +1273,12 @@ int main(int argc, char **argv) {
                 frontend.set_mouse_look([] { return g_analog_camera.load() && g_mouse_camera.load(); });
             }
             // Widescreen: the shape the frontend works out from the window reaches the game's camera at every poll.
-            extra = [rt = &runtime, fe = &frontend, previous = std::move(extra)]() {
+            extra = [rt = &runtime, fe = &frontend, mods = &mod_registry, previous = std::move(extra)]() {
                 keep_camera_aspect(*rt, fe->game_aspect());
+                mods->on_tick();
                 if (previous) previous();
             };
+            frontend.set_mods(&mod_registry, mods_config_path.string());
             frontend.attach(runtime, extra);
         } else if (window) {
             // A player asked for a window: never keep running invisibly.
